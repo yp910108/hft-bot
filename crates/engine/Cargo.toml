@@ -1,0 +1,12 @@
+[package]
+name = "engine"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+domain = { path = "../domain" }
+ledger = { path = "../ledger" }
+fsm = { path = "../fsm" }
+strategy = { path = "../strategy" }
+risk = { path = "../risk" }
+exchange = { path = "../exchange" }

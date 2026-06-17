@@ -1,0 +1,9 @@
+[package]
+name = "strategy"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+domain = { path = "../domain" }
+fsm = { path = "../fsm" }
+ledger = { path = "../ledger" }

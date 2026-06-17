@@ -1,0 +1,9 @@
+[package]
+name = "fsm"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+domain = { path = "../domain" }
+rust_decimal = { workspace = true }
+rust_decimal_macros = { workspace = true }

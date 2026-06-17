@@ -1,0 +1,15 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "hft-bot"
+path = "src/main.rs"
+
+[dependencies]
+domain = { path = "../domain" }
+engine = { path = "../engine" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
