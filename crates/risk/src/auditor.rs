@@ -89,7 +89,7 @@ mod tests {
             price: dec!(0.4),
             qty: dec!(100),
             role: OrderRole::Maker,
-            generation: Generation::first(),
+            generation: Generation::new(),
         }
     }
 

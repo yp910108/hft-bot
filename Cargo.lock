@@ -142,6 +142,8 @@ dependencies = [
  "fsm",
  "ledger",
  "risk",
+ "rust_decimal",
+ "rust_decimal_macros",
  "strategy",
 ]
 

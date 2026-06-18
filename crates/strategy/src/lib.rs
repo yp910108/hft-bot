@@ -135,7 +135,7 @@ impl GradientLadder {
                 continue;
             }
             let order = Order {
-                order_id: id_generator.next_id(),
+                order_id: id_generator.next(),
                 side,
                 direction: OrderDirection::Buy,
                 price,
@@ -209,7 +209,7 @@ mod tests {
             dec!(1000),
             &OrderConstraints::default(),
             &mut generator,
-            Generation::first(),
+            Generation::new(),
         );
         assert_eq!(commands.len(), 3);
 
@@ -244,7 +244,7 @@ mod tests {
             dec!(1000),
             &OrderConstraints::default(),
             &mut generator,
-            Generation::first(),
+            Generation::new(),
         );
         let ids: Vec<_> = commands
             .iter()
@@ -270,7 +270,7 @@ mod tests {
             dec!(105),
             &OrderConstraints::default(),
             &mut generator,
-            Generation::first(),
+            Generation::new(),
         );
         // 首档因不足 5 份被跳过，仅保留 2 档。
         assert_eq!(commands.len(), 2);
@@ -294,7 +294,7 @@ mod tests {
             dec!(1000),
             &OrderConstraints::default(),
             &mut generator,
-            Generation::first(),
+            Generation::new(),
         );
         assert!(commands.is_empty());
     }

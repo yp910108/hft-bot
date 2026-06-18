@@ -147,7 +147,7 @@ mod tests {
             price,
             filled_qty,
             cash,
-            generation: Generation::first(),
+            generation: Generation::new(),
         }
     }
 

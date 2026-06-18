@@ -53,7 +53,7 @@ mod tests {
             price: dec!(0.4),
             filled_qty: dec!(100),
             cash: dec!(40),
-            generation: Generation::first(),
+            generation: Generation::new(),
         };
         let event = ExchangeEvent::Filled(fill);
         // 成交事件应原样携带 Fill 数据，供账本更新使用。

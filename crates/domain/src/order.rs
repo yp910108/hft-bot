@@ -1,8 +1,8 @@
 //! 订单与成交的领域类型，以及用于消除撤单 / 改挂竞态的订单世代号。
 //!
 //! 对应策略风险修复项 #6：在异步高频环境下，「撤单尚未确认时又来一笔成交」
-//! 会导致基于过期状态误操作。本模块用单调递增的 [`Generation`] 给每一批挂单打标，
-//! 重算时旧世代的回报可被安全丢弃。
+//! 会导致基于过期状态误操作。本模块用单调递增的 [`Generation`] 给每一批挂单打标；
+//! 成交一律入账（成交不可撤销），世代号仅用于区分回报新旧、决定是否触发后续重算决策。
 
 use crate::types::{Money, OrderRole, Price, Qty, Side};
 use rust_decimal::RoundingStrategy;
@@ -12,19 +12,26 @@ use serde::{Deserialize, Serialize};
 /// 订单世代号：单调递增的批次标记。
 ///
 /// 每当策略发起一轮「撤旧单 → 重算 → 挂新单」，世代号自增一次。
-/// 交易所回报携带其所属世代，事件循环据此丢弃过期世代的回报，避免竞态。
+/// 交易所回报携带其所属世代，据此区分回报新旧（成交仍一律入账，旧世代成交入账后
+/// 不再触发新的重算决策）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Generation(pub u64);
 
 impl Generation {
     /// 初始世代。
-    pub fn first() -> Self {
+    pub fn new() -> Self {
         Self(0)
     }
 
     /// 返回下一个世代号。
     pub fn next(self) -> Self {
         Self(self.0 + 1)
+    }
+}
+
+impl Default for Generation {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -38,7 +45,8 @@ pub struct OrderId(pub u64);
 /// 订单标识生成器：持续产出单调递增、互不重复的 [`OrderId`]。
 #[derive(Debug, Clone, Default)]
 pub struct OrderIdGenerator {
-    next: u64,
+    /// 下一个待分配的标识值。
+    next_value: u64,
 }
 
 impl OrderIdGenerator {
@@ -47,10 +55,14 @@ impl OrderIdGenerator {
         Self::default()
     }
 
-    /// 产出下一个订单标识，内部计数随即自增。
-    pub fn next_id(&mut self) -> OrderId {
-        let id = OrderId(self.next);
-        self.next += 1;
+    /// 产出下一个订单标识，内部计数随即自增（命名与 [`Generation::next`] 对齐）。
+    ///
+    /// 此处刻意保留 `next` 之名以与 [`Generation::next`] 保持一致；它并非迭代器语义
+    /// （不返回 `Option`、序列无尽），故抑制 clippy 对 `Iterator::next` 的混淆告警。
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> OrderId {
+        let id = OrderId(self.next_value);
+        self.next_value += 1;
         id
     }
 }
@@ -185,7 +197,7 @@ mod tests {
 
     #[test]
     fn generation_increments_monotonically() {
-        let g0 = Generation::first();
+        let g0 = Generation::new();
         let g1 = g0.next();
         let g2 = g1.next();
         assert_eq!(g0, Generation(0));
@@ -198,9 +210,9 @@ mod tests {
     #[test]
     fn order_id_generator_yields_monotonic_unique_ids() {
         let mut generator = OrderIdGenerator::new();
-        let id0 = generator.next_id();
-        let id1 = generator.next_id();
-        let id2 = generator.next_id();
+        let id0 = generator.next();
+        let id1 = generator.next();
+        let id2 = generator.next();
         assert_eq!(id0, OrderId(0));
         assert_eq!(id1, OrderId(1));
         assert_eq!(id2, OrderId(2));
@@ -217,7 +229,7 @@ mod tests {
             price: Price::ZERO,
             qty: Qty::ZERO,
             role: OrderRole::Maker,
-            generation: Generation::first(),
+            generation: Generation::new(),
         };
         let command = Command::SubmitOrder(order);
         match command {
