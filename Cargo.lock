@@ -659,6 +659,8 @@ dependencies = [
  "domain",
  "fsm",
  "ledger",
+ "rust_decimal",
+ "rust_decimal_macros",
 ]
 
 [[package]]

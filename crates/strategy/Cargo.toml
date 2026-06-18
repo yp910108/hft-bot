@@ -7,3 +7,5 @@ edition = "2024"
 domain = { path = "../domain" }
 fsm = { path = "../fsm" }
 ledger = { path = "../ledger" }
+rust_decimal = { workspace = true }
+rust_decimal_macros = { workspace = true }
