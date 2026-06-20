@@ -37,6 +37,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
+name = "backtest"
+version = "0.1.0"
+dependencies = [
+ "domain",
+ "engine",
+ "exchange",
+ "fsm",
+ "risk",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "strategy",
+ "tokio",
+]
+
+[[package]]
 name = "bitflags"
 version = "2.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

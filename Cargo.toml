@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/app",
+    "crates/backtest",
     "crates/domain",
     "crates/engine",
     "crates/exchange",

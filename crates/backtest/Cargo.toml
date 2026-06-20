@@ -1,0 +1,15 @@
+[package]
+name = "backtest"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+domain = { path = "../domain" }
+exchange = { path = "../exchange" }
+engine = { path = "../engine" }
+risk = { path = "../risk" }
+strategy = { path = "../strategy" }
+fsm = { path = "../fsm" }
+rust_decimal = { workspace = true }
+rust_decimal_macros = { workspace = true }
+tokio = { workspace = true }

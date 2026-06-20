@@ -1,14 +1,15 @@
-//! 梯度接低模块：初始布阵（Gradient Low-Catching, Initial Deployment）。
+//! 梯度接低模块：初始布阵 + 跨侧配对重算（Gradient Low-Catching）。
 //!
-//! 对应策略说明书第四节。场开始时：
-//! 1. **选主战场**：对比双边 `best_ask`，选 `best_ask < 0.5` 的一侧作为做市主战场；
-//!    若两侧皆满足则取更低者，皆不满足则放弃布阵（返回空指令）。
-//! 2. **三层非饱和铺单**：以该侧 `best_ask` 为基准向下平铺三层 Maker 买单，
-//!    层距与池占比可配（默认 1 层 ask-0.01 用 2%、2 层 ask-0.02 用 3%、3 层 ask-0.03 用 5%），
-//!    4 层及以下保持真空。
+//! 对应策略说明书第四节。两个核心动作：
+//! 1. **初始布阵**（[`GradientLadder::deploy`]）：选 `best_ask < 0.5` 的一侧为主战场，
+//!    向下三层非饱和铺 Maker 买单。
+//! 2. **跨侧配对重算**（[`GradientLadder::recompute_after_fill`]）：每当本边 Maker 买单成交，
+//!    在成交价下方续挂追低，并撤销对面活跃单、按本边最新均价重算对面配对买入价，
+//!    确保 `本边均价 + 对面挂价 ≤ 1 - 最小利润空间`。配对价低于当前 Ask 直接挂 Maker，
+//!    否则转为 [`PendingOrder`] 挂起，等 Ask 跌到该价下方再补挂。
 //!
-//! 本模块为纯逻辑：输入行情与池额度，产出一组 [`Command`]，不直接触碰交易所
-//! （见架构决策：策略产出指令列表）。跨侧配对重算留待后续阶段。
+//! 本模块为纯逻辑：输入行情与持仓，产出一组 [`Command`]，不直接触碰交易所
+//! （见架构决策：策略产出指令列表）。
 
 use domain::market::MarketSnapshot;
 use domain::order::{
@@ -27,17 +28,24 @@ pub struct LadderRung {
     pub pool_fraction: Decimal,
 }
 
-/// 梯度接低的初始布阵配置：三层梯度 + 主战场判定阈值。
+/// 梯度接低的初始布阵配置：三层梯度 + 主战场判定阈值 + 跨侧重算参数。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LadderConfig {
     /// 三层梯度，从首档到末档。
     pub rungs: [LadderRung; 3],
     /// 主战场选择阈值：仅 best_ask 低于此值的一侧才可作为做市主战场。
     pub main_field_max_ask: Price,
+    /// 最小利润空间：对面配对价 = 1 - 本边均价 - 此值，确保双边均价之和留出利润。
+    pub min_profit_margin: Decimal,
+    /// 本边续挂追低的价格步长：成交价下方该距离处再挂一档继续追低。
+    pub follow_offset: Decimal,
+    /// 本边续挂追低动用核心做市池的比例。
+    pub follow_fraction: Decimal,
 }
 
 impl Default for LadderConfig {
-    /// 策略默认布阵：三层偏移 0.01/0.02/0.03，池占比 2%/3%/5%，主战场阈值 0.5。
+    /// 策略默认布阵：三层偏移 0.01/0.02/0.03，池占比 2%/3%/5%，主战场阈值 0.5，
+    /// 最小利润空间 0.02，续挂追低步长 0.01、占比 2%。
     fn default() -> Self {
         Self {
             rungs: [
@@ -55,8 +63,41 @@ impl Default for LadderConfig {
                 },
             ],
             main_field_max_ask: dec!(0.5),
+            min_profit_margin: dec!(0.02),
+            follow_offset: dec!(0.01),
+            follow_fraction: dec!(0.02),
         }
     }
+}
+
+/// 一笔本边成交的上下文，作为跨侧配对重算的输入。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FillContext {
+    /// 成交发生在哪一侧（本边）。
+    pub filled_side: Side,
+    /// 本笔成交价。
+    pub filled_price: Price,
+    /// 本边成交后的最新持仓股数（作为对面摽齐的目标）。
+    pub own_qty: Qty,
+    /// 对面当前持仓股数（用于算需补齐的差额）。
+    pub opposite_qty: Qty,
+    /// 本边成交后的最新加权均价。
+    pub own_average_price: Price,
+    /// 对面当前卖一价（Ask 审计用）；缺失时配对单只能挂起。
+    pub opposite_best_ask: Option<Price>,
+}
+
+/// 挂起的配对买单（Pending）：配对价 ≥ 当前 Ask 时暂不挂出，待 Ask 跌到该价下方再补挂。
+///
+/// 对应策略第四节「延迟补挂挂起机制」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingOrder {
+    /// 挂起的目标侧。
+    pub side: Side,
+    /// 目标配对买入价。
+    pub price: Price,
+    /// 目标买入股数。
+    pub qty: Qty,
 }
 
 /// 梯度接低初始布阵器。
@@ -153,6 +194,95 @@ impl GradientLadder {
         let budget = grid_maker_pool * pool_fraction;
         budget / price
     }
+
+    /// 跨侧配对重算：本边一笔 Maker 买单成交后触发。
+    ///
+    /// 三个动作：
+    /// 1. **本边续挂追低**：在成交价下方 `follow_offset` 处再挂一档 Maker 买单，继续拉低本边均价。
+    /// 2. **撤对面**：撤销对面当前全部活跃挂单（[`Command::CancelSide`]）。
+    /// 3. **重算对面配对价**：配对价 = `1 - 本边最新均价 - min_profit_margin`。配对量采用
+    ///    **目标摽齐**：对面目标持仓 = 本边持仓，只补齐差额（`own_qty - opposite_qty`），
+    ///    差额 ≤ 0 则不下单。使双边持仓趋于相等、`min(Q_up,Q_down)` 最大化且无浪费敞口，
+    ///    并从根本上避免「配对买入又触发新配对」的仓位滚雪球。
+    ///    配对价 < 对面当前 Ask 则直接挂 Maker；否则作为 [`PendingOrder`] 挂起延迟补挂。
+    ///
+    /// 价格与股数均按交易所精度向下量化、并经最小量约束校验；不达标的挂单跳过。
+    pub fn recompute_after_fill(
+        &self,
+        fill: &FillContext,
+        grid_maker_pool: Money,
+        constraints: &OrderConstraints,
+        id_generator: &mut OrderIdGenerator,
+        generation: Generation,
+    ) -> RecomputeResult {
+        let mut commands = Vec::new();
+        let mut pending = None;
+
+        // ① 本边续挂追低：成交价下方 follow_offset 再挂一档。
+        let follow_price = constraints.quantize_price(fill.filled_price - self.config.follow_offset);
+        if follow_price > Decimal::ZERO {
+            let follow_qty = constraints
+                .quantize_qty(self.rung_qty(grid_maker_pool, self.config.follow_fraction, follow_price));
+            if constraints.is_satisfied(follow_qty, follow_price) {
+                commands.push(Command::SubmitOrder(Order {
+                    order_id: id_generator.next(),
+                    side: fill.filled_side,
+                    direction: OrderDirection::Buy,
+                    price: follow_price,
+                    qty: follow_qty,
+                    role: OrderRole::Maker,
+                    generation,
+                }));
+            }
+        }
+
+        // ② 撤销对面全部活跃挂单。
+        let opposite = fill.filled_side.opposite();
+        commands.push(Command::CancelSide(opposite));
+
+        // ③ 重算对面配对价 = 1 - 本边均价 - 最小利润空间。
+        let pair_price = constraints
+            .quantize_price(Decimal::ONE - fill.own_average_price - self.config.min_profit_margin);
+        if pair_price > Decimal::ZERO {
+            // 配对量采用「目标摽齐」：对面目标持仓 = 本边持仓，只补齐差额。
+            // 差额 ≤ 0 表示对面已摽齐（或超过），不再下配对单——这是根除仓位滚雪球的关键
+            // （配对买入成交不会再无限放大持仓）。
+            let target_gap = fill.own_qty - fill.opposite_qty;
+            let pair_qty = constraints.quantize_qty(target_gap.max(Decimal::ZERO));
+            if constraints.is_satisfied(pair_qty, pair_price) {
+                // Ask 审计：配对价低于对面当前卖一价才能作为 Maker 直接挂出，否则挂起。
+                let can_post_now = matches!(fill.opposite_best_ask, Some(ask) if pair_price < ask);
+                if can_post_now {
+                    commands.push(Command::SubmitOrder(Order {
+                        order_id: id_generator.next(),
+                        side: opposite,
+                        direction: OrderDirection::Buy,
+                        price: pair_price,
+                        qty: pair_qty,
+                        role: OrderRole::Maker,
+                        generation,
+                    }));
+                } else {
+                    pending = Some(PendingOrder {
+                        side: opposite,
+                        price: pair_price,
+                        qty: pair_qty,
+                    });
+                }
+            }
+        }
+
+        RecomputeResult { commands, pending }
+    }
+}
+
+/// 跨侧重算的产出：应立即下发的指令 + 可能挂起的配对单。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecomputeResult {
+    /// 应立即下发给执行后端的指令（本边续挂、撤对面、可直接挂的配对单）。
+    pub commands: Vec<Command>,
+    /// 配对价 ≥ 对面 Ask 时挂起的配对单（等 Ask 跌到价下方再补挂）；无则为 `None`。
+    pub pending: Option<PendingOrder>,
 }
 
 #[cfg(test)]
@@ -297,5 +427,198 @@ mod tests {
             Generation::new(),
         );
         assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn recompute_follows_down_on_own_side() {
+        let ladder = GradientLadder::with_default_config();
+        let mut generator = OrderIdGenerator::new();
+        // 本边 Up 以 0.40 成交 100 股，本边均价 0.40，对面 Ask 0.65。
+        let result = ladder.recompute_after_fill(
+            &FillContext {
+                filled_side: Side::Up,
+                filled_price: dec!(0.40),
+                own_qty: dec!(100),
+                opposite_qty: dec!(0),
+                own_average_price: dec!(0.40),
+                opposite_best_ask: Some(dec!(0.65)),
+            },
+            dec!(1000),
+            &OrderConstraints::default(),
+            &mut generator,
+            Generation::new(),
+        );
+        // 应含一笔本边 Up 的续挂追低单，价格 = 0.40 - 0.01 = 0.39。
+        let follow = result.commands.iter().find_map(|c| match c {
+            Command::SubmitOrder(o) if o.side == Side::Up => Some(o),
+            _ => None,
+        });
+        let follow = follow.expect("应有本边续挂追低单");
+        assert_eq!(follow.price, dec!(0.39));
+    }
+
+    #[test]
+    fn recompute_cancels_opposite_side() {
+        let ladder = GradientLadder::with_default_config();
+        let mut generator = OrderIdGenerator::new();
+        let result = ladder.recompute_after_fill(
+            &FillContext {
+                filled_side: Side::Up,
+                filled_price: dec!(0.40),
+                own_qty: dec!(100),
+                opposite_qty: dec!(0),
+                own_average_price: dec!(0.40),
+                opposite_best_ask: Some(dec!(0.65)),
+            },
+            dec!(1000),
+            &OrderConstraints::default(),
+            &mut generator,
+            Generation::new(),
+        );
+        // 应撤销对面 Down 侧全部活跃挂单。
+        assert!(result
+            .commands
+            .contains(&Command::CancelSide(Side::Down)));
+    }
+
+    #[test]
+    fn recompute_posts_pair_when_below_ask() {
+        let ladder = GradientLadder::with_default_config();
+        let mut generator = OrderIdGenerator::new();
+        // 本边均价 0.40，配对价 = 1 - 0.40 - 0.02 = 0.58；对面 Ask 0.65 > 0.58 → 直接挂。
+        let result = ladder.recompute_after_fill(
+            &FillContext {
+                filled_side: Side::Up,
+                filled_price: dec!(0.40),
+                own_qty: dec!(100),
+                opposite_qty: dec!(0),
+                own_average_price: dec!(0.40),
+                opposite_best_ask: Some(dec!(0.65)),
+            },
+            dec!(1000),
+            &OrderConstraints::default(),
+            &mut generator,
+            Generation::new(),
+        );
+        assert!(result.pending.is_none());
+        // 应含一笔对面 Down 的配对买单，价 0.58。
+        let pair = result.commands.iter().find_map(|c| match c {
+            Command::SubmitOrder(o) if o.side == Side::Down => Some(o),
+            _ => None,
+        });
+        let pair = pair.expect("应有对面配对买单");
+        assert_eq!(pair.price, dec!(0.58));
+    }
+
+    #[test]
+    fn recompute_pends_pair_when_at_or_above_ask() {
+        let ladder = GradientLadder::with_default_config();
+        let mut generator = OrderIdGenerator::new();
+        // 配对价 0.58，但对面 Ask 仅 0.55 ≤ 0.58 → 不能直接挂，挂起为 Pending。
+        let result = ladder.recompute_after_fill(
+            &FillContext {
+                filled_side: Side::Up,
+                filled_price: dec!(0.40),
+                own_qty: dec!(100),
+                opposite_qty: dec!(0),
+                own_average_price: dec!(0.40),
+                opposite_best_ask: Some(dec!(0.55)),
+            },
+            dec!(1000),
+            &OrderConstraints::default(),
+            &mut generator,
+            Generation::new(),
+        );
+        let pending = result.pending.expect("配对价≥Ask 应挂起");
+        assert_eq!(pending.side, Side::Down);
+        assert_eq!(pending.price, dec!(0.58));
+        assert_eq!(pending.qty, dec!(100));
+        // 挂起时不应有对面 Down 的直接下单指令。
+        assert!(!result.commands.iter().any(|c| matches!(
+            c,
+            Command::SubmitOrder(o) if o.side == Side::Down
+        )));
+    }
+
+    #[test]
+    fn recompute_pair_price_leaves_profit_margin() {
+        let ladder = GradientLadder::with_default_config();
+        let mut generator = OrderIdGenerator::new();
+        // 本边均价 0.45，配对价 = 1 - 0.45 - 0.02 = 0.53。
+        // 本边均价 + 配对价 = 0.98 ≤ 1 - 0.02，留出了最小利润空间。
+        let result = ladder.recompute_after_fill(
+            &FillContext {
+                filled_side: Side::Up,
+                filled_price: dec!(0.45),
+                own_qty: dec!(100),
+                opposite_qty: dec!(0),
+                own_average_price: dec!(0.45),
+                opposite_best_ask: Some(dec!(0.70)),
+            },
+            dec!(1000),
+            &OrderConstraints::default(),
+            &mut generator,
+            Generation::new(),
+        );
+        let pair = result.commands.iter().find_map(|c| match c {
+            Command::SubmitOrder(o) if o.side == Side::Down => Some(o),
+            _ => None,
+        });
+        let pair = pair.expect("应有对面配对买单");
+        assert_eq!(pair.price, dec!(0.53));
+        assert!(dec!(0.45) + pair.price <= Decimal::ONE - dec!(0.02));
+    }
+
+    #[test]
+    fn recompute_no_pair_when_opposite_already_aligned() {
+        let ladder = GradientLadder::with_default_config();
+        let mut generator = OrderIdGenerator::new();
+        // 对面持仓 120 ≥ 本边 100 → 已摽齐，差额 ≤ 0，不应再下配对单（根除滚雪球）。
+        let result = ladder.recompute_after_fill(
+            &FillContext {
+                filled_side: Side::Up,
+                filled_price: dec!(0.40),
+                own_qty: dec!(100),
+                opposite_qty: dec!(120),
+                own_average_price: dec!(0.40),
+                opposite_best_ask: Some(dec!(0.65)),
+            },
+            dec!(1000),
+            &OrderConstraints::default(),
+            &mut generator,
+            Generation::new(),
+        );
+        assert!(result.pending.is_none());
+        assert!(!result.commands.iter().any(|c| matches!(
+            c,
+            Command::SubmitOrder(o) if o.side == Side::Down
+        )));
+    }
+
+    #[test]
+    fn recompute_pair_qty_is_alignment_gap() {
+        let ladder = GradientLadder::with_default_config();
+        let mut generator = OrderIdGenerator::new();
+        // 本边持仓 100、对面已有 30 → 只补差额 70（目标摽齐），而非固定值。
+        let result = ladder.recompute_after_fill(
+            &FillContext {
+                filled_side: Side::Up,
+                filled_price: dec!(0.40),
+                own_qty: dec!(100),
+                opposite_qty: dec!(30),
+                own_average_price: dec!(0.40),
+                opposite_best_ask: Some(dec!(0.65)),
+            },
+            dec!(1000),
+            &OrderConstraints::default(),
+            &mut generator,
+            Generation::new(),
+        );
+        let pair = result.commands.iter().find_map(|c| match c {
+            Command::SubmitOrder(o) if o.side == Side::Down => Some(o),
+            _ => None,
+        });
+        let pair = pair.expect("应有对面配对买单");
+        assert_eq!(pair.qty, dec!(70));
     }
 }
