@@ -17,6 +17,10 @@
   - **类型**（结构体 struct、枚举 enum、类型别名 type、trait）：`use` 到**具体项**，代码中直接用短名。例：`use crate::types::Money;` 后写 `Money`。
   - **函数**：`use` 到其**父模块**，调用时带模块名。例：`use crate::math;` 后写 `math::compute()`，而非 `use crate::math::compute;`。这样既表明函数非本地定义，又不必重复完整路径。
   - **例外**：当不同模块的同名项同时引入造成命名冲突时，改为引入各自父模块来消歧义（或用 `as` 重命名）。
+- **`lib.rs` 职责单一**：一旦 crate 拆出子模块（有 `pub mod xxx;`），`lib.rs` 就只当「门面/索引」——只放模块声明、`pub use` 重导出与 crate 级文档，**不再塞实质代码**。实质类型/逻辑一律放进各自的子模块文件（如账本放 `ledger.rs`、持久化放 `wal.rs`）。反例：曾经 `ledger/lib.rs` 既声明 `pub mod wal` 又自含 356 行账本代码，是身兼二职的「混合形态」，已拆分。单文件 crate（只有 `lib.rs`、无子模块，如 fsm/strategy/engine）不受此约束。
+- **`pub use` 重导出按需使用，不强求**：判断标准是 crate 有没有「主类型」。
+  - **有单一主角**：在 `lib.rs` 用 `pub use` 把主类型提到 crate 顶层，外部写 `crate_name::MainType`，避免 `crate_name::module::MainType` 的双重名绕口。例：`ledger` 的 `pub use ledger::Ledger;` → 外部用 `ledger::Ledger`。
+  - **一堆平级类型（词汇表型）**：保留模块路径，**不要**用 `pub use` 平铺到顶层——模块名本身承载分类信息，平铺会丢失分类、污染顶层命名空间。例：`domain` 应保持 `domain::types::Money`、`domain::order::Fill`，`exchange`/`risk` 同理保留 `exchange::event::ExchangeEvent`、`risk::auditor::RiskAuditor`。
 
 ## 项目背景
 - 这是一个 Polymarket BTC 15 分钟周期二元预测市场的自动化高频交易机器人。

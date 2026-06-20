@@ -278,6 +278,7 @@ dependencies = [
  "domain",
  "rust_decimal",
  "rust_decimal_macros",
+ "serde_json",
 ]
 
 [[package]]
