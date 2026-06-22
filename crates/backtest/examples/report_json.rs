@@ -91,7 +91,7 @@ fn side_cost(engine: &Engine, side: Side) -> f64 {
 
 /// 跑一场回测,记录逐笔成交,返回 JSON Value。
 fn run_with_log(
-    market: &backtest::market::SyntheticMarket,
+    market: &backtest::market::Market,
     title: String,
     condition_id: String,
     total_capital: Decimal,

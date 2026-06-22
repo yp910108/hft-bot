@@ -1,12 +1,10 @@
 //! 事件循环层：单写者主循环，把账本、状态机、策略、风控、执行后端串成闭环。
 //!
-//! 对应策略说明书第三节「订单成交事件驱动」架构。本层为**同步核心**：
-//! 不自持 channel 与后端，而是暴露 [`Engine::handle_event`]（喂一个交易所事件、返回应下发的指令）
-//! 与 [`Engine::start`]（初始布阵），由上层（app）负责对接 mpsc 事件流与执行后端。
-//! 这样核心逻辑可纯同步地单元测试，且天然满足单写者串行（一次只处理一个事件）。
+//! 暴露 [`Engine::handle_event`]（喂一个交易所事件、返回应下发的指令）
+//! 与 [`Engine::start`]（初始布阵），由上层负责对接事件流与执行后端。
+//! 核心逻辑纯同步，天然满足单写者串行。
 //!
-//! **竞态隔离（修复风险 #6）**：每批新挂单世代号自增；成交 / 撤单回报携带其所属世代，
-//! 低于当前世代的回报视为过期，直接丢弃，避免基于过期状态误操作。
+//! 竞态隔离：每批新挂单世代号自增；低于当前世代的成交回报入账但不触发重算。
 
 use domain::market::MarketSnapshot;
 use domain::order::{Command, Generation, Order, OrderConstraints, OrderDirection, OrderIdGenerator};
@@ -182,7 +180,7 @@ impl Engine {
                     return self.hedge_step();
                 }
                 // 常规阶段：仅对「当前世代 + 主战场侧（主动接低）」的买入成交触发跨侧重算；
-                // 对面配对成交不触发，断开正反馈滚雪球；旧世代成交亦不触发（修复 #6）。
+                // 对面配对成交不触发，断开正反馈滚雪球；旧世代成交亦不触发。
                 let is_main_field = self.main_field == Some(fill.side);
                 if is_current && is_main_field && fill.direction == OrderDirection::Buy {
                     self.recompute_after_fill(&fill)

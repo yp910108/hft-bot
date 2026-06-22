@@ -1,7 +1,6 @@
 //! 市场行情类型：单侧盘口顶部、双边市场快照与 Mark Price 计算。
 //!
-//! 对应策略风险修复项 #8：策略多处使用 Mark Price 却从未定义其口径。
-//! 本模块明确将 Mark Price 定义为盘口中间价 `(best_bid + best_ask) / 2`；
+//! Mark Price 定义为盘口中间价 `(best_bid + best_ask) / 2`；
 //! 当某一侧盘口缺失（只有买价或只有卖价）时，回退到最近一笔成交价。
 
 use crate::types::{Price, Side};
