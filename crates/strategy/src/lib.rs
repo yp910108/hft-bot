@@ -274,6 +274,63 @@ impl GradientLadder {
 
         RecomputeResult { commands, pending }
     }
+
+    /// 对冲单步：产出一条 Taker 主动买单，用于动态对冲 / EV 对冲阶段。
+    ///
+    /// 对应策略说明书第五、六节。一个函数覆盖两态，差异仅在 `cap`：
+    /// - **动态对冲**（追买瘸腿侧补到与对面摽齐）：`cap = Some(摽齐缺口)`，单步量为
+    ///   `min(预算可买量, 缺口)`；缺口 ≤ 0 表示已摽齐，返回空。
+    /// - **EV 对冲**（增厚优势方逼正 EV）：`cap = None`，单步量纯由预算封顶。
+    ///
+    /// 以该侧当前 `best_ask` 作为 Taker 成交价（卖一缺失则返回空，无从吃单）；价格与股数
+    /// 按交易所精度向下量化，并经最小量约束校验，不达标则跳过（同布阵 / 重算的资金纪律）。
+    /// 至多产出一条指令，由上层（engine）负责计步与上限控制。
+    // 参数虽多但各自语义独立（追买侧 / 上限 / 行情 / 预算 / 约束 / 下单上下文），
+    // 与同模块的 deploy / recompute_after_fill 风格一致，不强行打包成上下文结构体。
+    #[allow(clippy::too_many_arguments)]
+    pub fn hedge_taker_step(
+        &self,
+        side: Side,
+        cap: Option<Qty>,
+        market: &MarketSnapshot,
+        step_budget: Money,
+        constraints: &OrderConstraints,
+        id_generator: &mut OrderIdGenerator,
+        generation: Generation,
+    ) -> Vec<Command> {
+        // 摽齐缺口为 Some 且 ≤ 0：已无需补，直接收手本步。
+        if matches!(cap, Some(gap) if gap <= Decimal::ZERO) {
+            return Vec::new();
+        }
+        // Taker 以对面卖一价吃单；卖一缺失则无从成交。
+        let Some(best_ask) = market.book(side).best_ask else {
+            return Vec::new();
+        };
+        if best_ask <= Decimal::ZERO {
+            return Vec::new();
+        }
+
+        // 单步量 = 预算可买量，再受摽齐缺口封顶（若有）。
+        let budget_qty = step_budget / best_ask;
+        let target_qty = match cap {
+            Some(gap) => budget_qty.min(gap),
+            None => budget_qty,
+        };
+        let qty = constraints.quantize_qty(target_qty);
+        if !constraints.is_satisfied(qty, best_ask) {
+            return Vec::new();
+        }
+
+        vec![Command::SubmitOrder(Order {
+            order_id: id_generator.next(),
+            side,
+            direction: OrderDirection::Buy,
+            price: best_ask,
+            qty,
+            role: OrderRole::Taker,
+            generation,
+        })]
+    }
 }
 
 /// 跨侧重算的产出：应立即下发的指令 + 可能挂起的配对单。
@@ -620,5 +677,144 @@ mod tests {
         });
         let pair = pair.expect("应有对面配对买单");
         assert_eq!(pair.qty, dec!(70));
+    }
+
+    /// 构造仅设某侧 best_ask 的市场快照（对冲单步用）。
+    fn market_one_side_ask(side: Side, ask: Price) -> MarketSnapshot {
+        let book = BookTop {
+            best_bid: None,
+            best_ask: Some(ask),
+            last_trade: None,
+        };
+        match side {
+            Side::Up => MarketSnapshot {
+                up: book,
+                down: BookTop::default(),
+            },
+            Side::Down => MarketSnapshot {
+                up: BookTop::default(),
+                down: book,
+            },
+        }
+    }
+
+    #[test]
+    fn hedge_step_capped_by_alignment_gap() {
+        let ladder = GradientLadder::with_default_config();
+        let mut generator = OrderIdGenerator::new();
+        // 预算 1000、卖一 0.50 → 可买 2000 股；但缺口仅 100 → 受缺口封顶为 100。
+        let commands = ladder.hedge_taker_step(
+            Side::Up,
+            Some(dec!(100)),
+            &market_one_side_ask(Side::Up, dec!(0.50)),
+            dec!(1000),
+            &OrderConstraints::default(),
+            &mut generator,
+            Generation::new(),
+        );
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            Command::SubmitOrder(o) => {
+                assert_eq!(o.side, Side::Up);
+                assert_eq!(o.role, OrderRole::Taker);
+                assert_eq!(o.price, dec!(0.50));
+                assert_eq!(o.qty, dec!(100));
+            }
+            _ => panic!("应为 SubmitOrder"),
+        }
+    }
+
+    #[test]
+    fn hedge_step_capped_by_budget() {
+        let ladder = GradientLadder::with_default_config();
+        let mut generator = OrderIdGenerator::new();
+        // 预算 50、卖一 0.50 → 可买 100 股；缺口 1000 远大于预算 → 受预算封顶为 100。
+        let commands = ladder.hedge_taker_step(
+            Side::Up,
+            Some(dec!(1000)),
+            &market_one_side_ask(Side::Up, dec!(0.50)),
+            dec!(50),
+            &OrderConstraints::default(),
+            &mut generator,
+            Generation::new(),
+        );
+        match &commands[0] {
+            Command::SubmitOrder(o) => assert_eq!(o.qty, dec!(100)),
+            _ => panic!("应为 SubmitOrder"),
+        }
+    }
+
+    #[test]
+    fn hedge_step_ev_uses_budget_when_no_cap() {
+        let ladder = GradientLadder::with_default_config();
+        let mut generator = OrderIdGenerator::new();
+        // EV 对冲：cap=None，纯预算封顶。预算 60、卖一 0.40 → 150 股。
+        let commands = ladder.hedge_taker_step(
+            Side::Down,
+            None,
+            &market_one_side_ask(Side::Down, dec!(0.40)),
+            dec!(60),
+            &OrderConstraints::default(),
+            &mut generator,
+            Generation::new(),
+        );
+        match &commands[0] {
+            Command::SubmitOrder(o) => {
+                assert_eq!(o.side, Side::Down);
+                assert_eq!(o.qty, dec!(150));
+            }
+            _ => panic!("应为 SubmitOrder"),
+        }
+    }
+
+    #[test]
+    fn hedge_step_empty_when_no_ask() {
+        let ladder = GradientLadder::with_default_config();
+        let mut generator = OrderIdGenerator::new();
+        // 该侧无卖一价 → 无从吃单，返回空。
+        let commands = ladder.hedge_taker_step(
+            Side::Up,
+            Some(dec!(100)),
+            &MarketSnapshot::default(),
+            dec!(1000),
+            &OrderConstraints::default(),
+            &mut generator,
+            Generation::new(),
+        );
+        assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn hedge_step_empty_when_gap_non_positive() {
+        let ladder = GradientLadder::with_default_config();
+        let mut generator = OrderIdGenerator::new();
+        // 缺口 ≤ 0（已摽齐）→ 不再补，返回空。
+        let commands = ladder.hedge_taker_step(
+            Side::Up,
+            Some(dec!(0)),
+            &market_one_side_ask(Side::Up, dec!(0.50)),
+            dec!(1000),
+            &OrderConstraints::default(),
+            &mut generator,
+            Generation::new(),
+        );
+        assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn hedge_step_skips_below_min_order_size() {
+        let ladder = GradientLadder::with_default_config();
+        let mut generator = OrderIdGenerator::new();
+        // 缺口仅 3 股 < 最小 5 份 → 跳过（不上调，保持纪律）。
+        let commands = ladder.hedge_taker_step(
+            Side::Up,
+            Some(dec!(3)),
+            &market_one_side_ask(Side::Up, dec!(0.50)),
+            dec!(1000),
+            &OrderConstraints::default(),
+            &mut generator,
+            Generation::new(),
+        );
+        assert!(commands.is_empty());
     }
 }

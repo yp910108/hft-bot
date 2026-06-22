@@ -76,6 +76,11 @@ impl StateMachine {
         self.state
     }
 
+    /// 返回状态机的阈值配置（供上层读取对冲亏损线等参数判定瘸腿侧）。
+    pub fn thresholds(&self) -> Thresholds {
+        self.thresholds
+    }
+
     /// 依据输入评估流转，更新并返回结果。
     pub fn step(&mut self, inputs: &StepInputs) -> Transition {
         let next = self.next_state(inputs);
@@ -235,6 +240,15 @@ mod tests {
     fn starts_in_initialization() {
         let machine = StateMachine::new(thresholds());
         assert_eq!(machine.state(), RobotState::Initialization);
+    }
+
+    #[test]
+    fn thresholds_getter_returns_configured_values() {
+        let machine = StateMachine::new(thresholds());
+        let t = machine.thresholds();
+        assert_eq!(t.hedge_loss_trigger, dec!(30));
+        assert_eq!(t.hedge_safety_price, dec!(0.5));
+        assert_eq!(t.profit_target, dec!(15));
     }
 
     #[test]

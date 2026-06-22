@@ -7,6 +7,7 @@
 use crate::market::SyntheticMarket;
 use domain::market::MarketSnapshot;
 use domain::order::Command;
+use domain::state::RobotState;
 use domain::types::{Money, Side};
 use engine::{Engine, EngineConfig};
 use exchange::backend::ExchangeBackend;
@@ -41,6 +42,8 @@ pub struct BacktestReport {
     pub final_pnl: Money,
     /// 全程累计成交笔数。
     pub fill_count: usize,
+    /// 交割时所处的状态机状态，用于统计本场是否走到对冲 / EV / 收手。
+    pub final_state: RobotState,
 }
 
 /// 用一场合成行情驱动一次完整回测。
@@ -142,6 +145,7 @@ fn settle(engine: &Engine, winner: Side, fill_count: usize) -> BacktestReport {
         total_cost,
         final_pnl,
         fill_count,
+        final_state: engine.state(),
     }
 }
 
@@ -167,6 +171,9 @@ mod tests {
             },
             engine_config: EngineConfig {
                 grid_maker_pool: pools.grid_maker(),
+                hedge_attack_pool: pools.hedge_attack(),
+                hedge_step_fraction: dec!(0.2),
+                max_taker_steps: 5,
                 constraints: OrderConstraints::default(),
             },
         };
@@ -229,5 +236,36 @@ mod tests {
         let report_b = run(&market, &config, ladder, auditor, fee);
         // 同种子同配置 → 回测完全可复现。
         assert_eq!(report_a, report_b);
+    }
+
+    #[test]
+    fn hedging_is_reachable_across_sessions() {
+        // 端到端验证对冲机制已接通：跑多场震荡行情，至少有一场走到动态对冲态
+        // （瘸腿触发复合边界）。这是阶段 10 对冲落地的关键证据——此前 engine 进入对冲态
+        // 不产任何指令、状态机也到不了对冲态。
+        let (config, _ladder, _auditor, fee) = backtest_setup();
+        let mut reached_hedging = false;
+        for seed in 0..50u64 {
+            let market = market::generate(&SyntheticMarketConfig {
+                drift: 0.0,
+                volatility: 200.0,
+                steps: 300,
+                seed,
+                ..SyntheticMarketConfig::default()
+            });
+            let report = run(
+                &market,
+                &config,
+                GradientLadder::with_default_config(),
+                RiskAuditor::with_default_guard(CapitalPools::with_default_ratios(config.total_capital)),
+                fee,
+            );
+            if matches!(report.final_state, RobotState::DynamicHedging { .. } | RobotState::EvHedging)
+            {
+                reached_hedging = true;
+                break;
+            }
+        }
+        assert!(reached_hedging, "震荡多场中应至少有一场走到对冲态");
     }
 }

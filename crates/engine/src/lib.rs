@@ -16,6 +16,8 @@ use exchange::event::ExchangeEvent;
 use fsm::{StateMachine, StepInputs, Thresholds};
 use ledger::Ledger;
 use risk::auditor::RiskAuditor;
+use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use strategy::{FillContext, GradientLadder, PendingOrder};
 
 /// 事件循环的运行参数。
@@ -23,8 +25,45 @@ use strategy::{FillContext, GradientLadder, PendingOrder};
 pub struct EngineConfig {
     /// 核心做市池额度上限，供梯度布阵分配。
     pub grid_maker_pool: Money,
+    /// 动量对冲池额度上限，供对冲阶段 Taker 单分配。
+    pub hedge_attack_pool: Money,
+    /// 对冲单步预算比例：单步 Taker 预算 = 动量对冲池 × 此比例。
+    pub hedge_step_fraction: Decimal,
+    /// 对冲阶段 Taker 步数硬上限（每个对冲阶段独立计数，达上限停手扛到交割）。
+    pub max_taker_steps: u32,
     /// 交易所最小量与精度约束。
     pub constraints: OrderConstraints,
+}
+
+/// 对冲阶段类别：用于「刚进入 / 切换对冲阶段」的边沿检测与 Taker 步数重置。
+///
+/// 不直接用状态机的 [`RobotState`]，是因为 `DynamicHedging` 的双负计数自增也会
+/// 改变状态变体（被 `is_moved` 误判为「刚进入」），故归并为粗粒度的阶段类别：
+/// `None`（非对冲）/ `Dynamic` / `Ev`，只在类别真正变化时才视为边沿。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HedgePhase {
+    /// 非对冲阶段。
+    None,
+    /// 动态对冲阶段（追买瘸腿侧摽齐）。
+    Dynamic,
+    /// EV 对冲阶段（增厚优势方逼正 EV）。
+    Ev,
+}
+
+impl HedgePhase {
+    /// 由状态机状态归类到对冲阶段类别。
+    fn of(state: RobotState) -> Self {
+        match state {
+            RobotState::DynamicHedging { .. } => HedgePhase::Dynamic,
+            RobotState::EvHedging => HedgePhase::Ev,
+            _ => HedgePhase::None,
+        }
+    }
+
+    /// 是否属于对冲阶段（Dynamic 或 Ev）。
+    fn is_hedging(self) -> bool {
+        matches!(self, HedgePhase::Dynamic | HedgePhase::Ev)
+    }
 }
 
 /// 单写者事件循环。
@@ -45,6 +84,10 @@ pub struct Engine {
     main_field: Option<Side>,
     /// 挂起的配对买单：配对价 ≥ 对面 Ask 时暂存，待 Ask 跌到价下方再补挂。
     pending_orders: Vec<PendingOrder>,
+    /// 当前所处对冲阶段类别，用于边沿检测（进入 / 切换阶段时重置 Taker 计数）。
+    hedge_phase: HedgePhase,
+    /// 当前对冲阶段已发出的 Taker 步数，进入 / 切换阶段时归零，达上限后停发。
+    taker_steps: u32,
     /// 是否已收手：进入 FinalSettlement（利润锁定）后置位，此后停止一切新开仓，
     /// 已持仓扛到交割兑现，避免继续滚仓位被反向大单吃掉利润。
     settled: bool,
@@ -71,6 +114,8 @@ impl Engine {
             market: MarketSnapshot::default(),
             main_field: None,
             pending_orders: Vec::new(),
+            hedge_phase: HedgePhase::None,
+            taker_steps: 0,
             settled: false,
             config,
         }
@@ -106,11 +151,13 @@ impl Engine {
             ExchangeEvent::BookUpdate(snapshot) => {
                 self.market = snapshot;
                 self.drive_state_machine();
+                self.sync_hedge_phase();
                 if let Some(settle) = self.enter_settlement_if_locked() {
                     return settle;
                 }
-                // 已收手则不再补挂；否则检查挂起的配对单：对面 Ask 跌到目标价下方则补挂。
-                if self.settled {
+                // 已收手则不再补挂；对冲阶段不在行情驱动下主动发 Taker（推进一律由成交驱动，
+                // 避免一个 tick 内连环发单打穿步数上限）；常规阶段检查挂起的配对单。
+                if self.settled || self.hedge_phase.is_hedging() {
                     Vec::new()
                 } else {
                     self.try_post_pending()
@@ -123,14 +170,21 @@ impl Engine {
                 self.ledger.apply_fill(&fill);
                 self.free_cash -= fill.cash;
                 self.drive_state_machine();
+                self.sync_hedge_phase();
                 if let Some(settle) = self.enter_settlement_if_locked() {
                     return settle;
                 }
-                // 已收手则停止一切新开仓；否则仅对「当前世代 + 主战场侧（主动接低）」的买入成交
-                // 触发跨侧重算；对面配对成交不触发，断开正反馈滚雪球；旧世代成交亦不触发（修复 #6）。
+                if self.settled {
+                    return Vec::new();
+                }
+                // 对冲阶段：每笔成交评估是否再推进一步 Taker（步步串行：发单→即时成交→再评估）。
+                if self.hedge_phase.is_hedging() {
+                    return self.hedge_step();
+                }
+                // 常规阶段：仅对「当前世代 + 主战场侧（主动接低）」的买入成交触发跨侧重算；
+                // 对面配对成交不触发，断开正反馈滚雪球；旧世代成交亦不触发（修复 #6）。
                 let is_main_field = self.main_field == Some(fill.side);
-                if !self.settled && is_current && is_main_field && fill.direction == OrderDirection::Buy
-                {
+                if is_current && is_main_field && fill.direction == OrderDirection::Buy {
                     self.recompute_after_fill(&fill)
                 } else {
                     Vec::new()
@@ -138,6 +192,18 @@ impl Engine {
             }
             // 拒单与撤单确认暂不触发新指令。
             ExchangeEvent::Rejected { .. } | ExchangeEvent::Canceled(_) => Vec::new(),
+        }
+    }
+
+    /// 同步对冲阶段类别：阶段类别发生变化（进入或在 Dynamic/Ev 间切换）时，重置 Taker 步数。
+    ///
+    /// 用粗粒度的 [`HedgePhase`] 而非 [`RobotState`] 做边沿检测，避免 `DynamicHedging`
+    /// 的双负计数自增被误判为「刚进入对冲」而错误重置 / 重复发单。
+    fn sync_hedge_phase(&mut self) {
+        let phase = HedgePhase::of(self.state_machine.state());
+        if phase != self.hedge_phase {
+            self.hedge_phase = phase;
+            self.taker_steps = 0;
         }
     }
 
@@ -217,13 +283,97 @@ impl Engine {
         commands
     }
 
-    /// 依据当前账本与行情驱动状态机评估一次流转。
-    fn drive_state_machine(&mut self) {
+    /// 依据当前账本与行情驱动状态机评估一次流转，返回流转结果。
+    fn drive_state_machine(&mut self) -> fsm::Transition {
         let inputs = StepInputs {
             position: self.ledger.snapshot(),
             market: self.market,
         };
-        self.state_machine.step(&inputs);
+        self.state_machine.step(&inputs)
+    }
+
+    /// 对冲单步推进：据当前对冲阶段决定追买侧与单步量上限，产出至多一条 Taker 指令。
+    ///
+    /// 达步数上限则停手（扛到交割）。实际产出经风控的 SubmitOrder 时，Taker 步数自增一次。
+    fn hedge_step(&mut self) -> Vec<Command> {
+        if self.taker_steps >= self.config.max_taker_steps {
+            return Vec::new();
+        }
+        // 据阶段确定追买侧与单步量上限（cap）。
+        let (side, cap) = match self.hedge_phase {
+            // 动态对冲：追买瘸腿侧，补到与对面摽齐（cap = 摽齐缺口）。
+            HedgePhase::Dynamic => match self.lame_side() {
+                Some(side) => {
+                    let gap = self.ledger.qty(side.opposite()) - self.ledger.qty(side);
+                    (side, Some(gap))
+                }
+                None => return Vec::new(),
+            },
+            // EV 对冲：追买优势方增厚筹码（cap = None，纯预算封顶）。
+            HedgePhase::Ev => match self.advantaged_side() {
+                Some(side) => (side, None),
+                None => return Vec::new(),
+            },
+            HedgePhase::None => return Vec::new(),
+        };
+
+        let step_budget = self.config.hedge_attack_pool * self.config.hedge_step_fraction;
+        self.current_generation = self.current_generation.next();
+        let commands: Vec<Command> = self
+            .ladder
+            .hedge_taker_step(
+                side,
+                cap,
+                &self.market,
+                step_budget,
+                &self.config.constraints,
+                &mut self.id_generator,
+                self.current_generation,
+            )
+            .into_iter()
+            .filter(|command| self.approve_command(command))
+            .collect();
+        // 仅在实际产出对冲指令时计步（扑空 / 被风控拦截不消耗步数）。
+        if !commands.is_empty() {
+            self.taker_steps += 1;
+        }
+        commands
+    }
+
+    /// 动态对冲的瘸腿侧：条件 PnL 穿透对冲亏损线的一侧；双侧同时穿透则取亏损更深的一侧。
+    fn lame_side(&self) -> Option<Side> {
+        let position = self.ledger.snapshot();
+        let trigger = self.state_machine.thresholds().hedge_loss_trigger;
+        let up_pnl = position.up_win_pnl();
+        let down_pnl = position.down_win_pnl();
+        let up_breached = up_pnl <= -trigger;
+        let down_breached = down_pnl <= -trigger;
+        match (up_breached, down_breached) {
+            // 双侧皆穿透：追买亏损更深（PnL 更小）的一侧。
+            (true, true) => Some(if up_pnl <= down_pnl {
+                Side::Up
+            } else {
+                Side::Down
+            }),
+            (true, false) => Some(Side::Up),
+            (false, true) => Some(Side::Down),
+            (false, false) => None,
+        }
+    }
+
+    /// EV 对冲的优势方：以 Up 侧 Mark Price 近似 Up 胜出概率，> 0.5 则优势在 Up，否则 Down。
+    ///
+    /// Mark Price 缺失时无从判定优势方，返回 `None`（本步不发对冲单）。
+    fn advantaged_side(&self) -> Option<Side> {
+        self.market
+            .mark_price(Side::Up)
+            .map(|up_probability| {
+                if up_probability > dec!(0.5) {
+                    Side::Up
+                } else {
+                    Side::Down
+                }
+            })
     }
 
     /// 发起一批梯度布阵：世代号自增，产出经风控通过的下单指令。
@@ -277,6 +427,9 @@ mod tests {
         let pools = CapitalPools::with_default_ratios(total_capital);
         let config = EngineConfig {
             grid_maker_pool: pools.grid_maker(),
+            hedge_attack_pool: pools.hedge_attack(),
+            hedge_step_fraction: dec!(0.2),
+            max_taker_steps: 5,
             constraints: OrderConstraints::default(),
         };
         Engine::new(
@@ -485,5 +638,181 @@ mod tests {
             generation: Generation(1),
         }));
         assert!(after_fill.is_empty());
+    }
+
+    /// 构造带完整买卖盘的双边市场快照（Mark Price 可由中间价计算）。
+    fn full_book(
+        up_bid: Money,
+        up_ask: Money,
+        down_bid: Money,
+        down_ask: Money,
+    ) -> ExchangeEvent {
+        ExchangeEvent::BookUpdate(MarketSnapshot {
+            up: BookTop {
+                best_bid: Some(up_bid),
+                best_ask: Some(up_ask),
+                last_trade: None,
+            },
+            down: BookTop {
+                best_bid: Some(down_bid),
+                best_ask: Some(down_ask),
+                last_trade: None,
+            },
+        })
+    }
+
+    #[test]
+    fn fill_into_dynamic_hedging_emits_taker_step() {
+        let mut engine = engine();
+        // Up 盘口 mark 0.075 < 安全价 0.5（瘸腿确认），Down mark 0.575。主战场 Up。
+        engine.handle_event(full_book(dec!(0.05), dec!(0.10), dec!(0.55), dec!(0.60)));
+        engine.start();
+        // 一笔 Down 重仓成交：down_qty=100、总成本 60 → up_win_pnl = 0 - 60 = -60 ≤ -30，
+        // 且 Up mark 0.075 < 0.5 → 触发动态对冲，追买瘸腿侧 Up。
+        let commands = engine.handle_event(ExchangeEvent::Filled(Fill {
+            order_id: OrderId(0),
+            side: Side::Down,
+            direction: OrderDirection::Buy,
+            price: dec!(0.60),
+            filled_qty: dec!(100),
+            cash: dec!(60),
+            generation: Generation(1),
+        }));
+        assert!(matches!(
+            engine.state(),
+            RobotState::DynamicHedging { .. }
+        ));
+        // 首发对冲：一条 Up 侧 Taker 买单，价取 Up 卖一 0.10，量 = 摽齐缺口 min(预算可买, gap=100)。
+        // 预算 = 动量池 225 × 0.2 = 45 → 可买 450，受缺口 100 封顶 → 100 股。
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            Command::SubmitOrder(o) => {
+                assert_eq!(o.side, Side::Up);
+                assert_eq!(o.role, OrderRole::Taker);
+                assert_eq!(o.price, dec!(0.10));
+                assert_eq!(o.qty, dec!(100));
+            }
+            _ => panic!("应为对冲 Taker SubmitOrder"),
+        }
+    }
+
+    #[test]
+    fn hedging_book_update_does_not_emit_taker() {
+        let mut engine = engine();
+        engine.handle_event(full_book(dec!(0.05), dec!(0.10), dec!(0.55), dec!(0.60)));
+        engine.start();
+        // 先进入动态对冲。
+        engine.handle_event(ExchangeEvent::Filled(Fill {
+            order_id: OrderId(0),
+            side: Side::Down,
+            direction: OrderDirection::Buy,
+            price: dec!(0.60),
+            filled_qty: dec!(100),
+            cash: dec!(60),
+            generation: Generation(1),
+        }));
+        assert!(matches!(engine.state(), RobotState::DynamicHedging { .. }));
+        // 对冲态下，行情更新绝不主动发 Taker（推进一律由成交驱动，避免一个 tick 连环失控）。
+        let on_book = engine.handle_event(full_book(dec!(0.05), dec!(0.11), dec!(0.55), dec!(0.60)));
+        assert!(on_book.is_empty());
+    }
+
+    #[test]
+    fn taker_steps_capped_at_max_in_ev_phase() {
+        let mut engine = engine();
+        // 直接置于 EV 对冲阶段（cap=None，每步纯预算封顶、不会因摽齐自然停手，便于验证步数上限）。
+        // Up mark = (0.58+0.62)/2 = 0.60 > 0.5 → 优势方 Up。
+        engine.market = MarketSnapshot {
+            up: BookTop {
+                best_bid: Some(dec!(0.58)),
+                best_ask: Some(dec!(0.62)),
+                last_trade: None,
+            },
+            down: BookTop::default(),
+        };
+        engine.hedge_phase = HedgePhase::Ev;
+        engine.taker_steps = 0;
+        // 连续推进 7 次：前 5 次（max_taker_steps=5）各产出一条 Taker，之后停手。
+        let mut emitted = 0;
+        for _ in 0..7 {
+            if !engine.hedge_step().is_empty() {
+                emitted += 1;
+            }
+        }
+        assert_eq!(emitted, 5);
+        assert_eq!(engine.taker_steps, 5);
+    }
+
+    #[test]
+    fn lame_side_picks_deeper_loss_when_both_breached() {
+        let mut engine = engine();
+        engine.handle_event(full_book(dec!(0.05), dec!(0.10), dec!(0.05), dec!(0.10)));
+        engine.start();
+        // 两侧都建少量仓但总成本很高 → 双边皆穿透；Down 更亏（qty 更小）。
+        // Up 20 股、Down 10 股、总成本 100：up_win_pnl=-80、down_win_pnl=-90，均 ≤ -30。
+        engine.handle_event(ExchangeEvent::Filled(Fill {
+            order_id: OrderId(0),
+            side: Side::Up,
+            direction: OrderDirection::Buy,
+            price: dec!(0.10),
+            filled_qty: dec!(20),
+            cash: dec!(50),
+            generation: Generation(1),
+        }));
+        engine.handle_event(ExchangeEvent::Filled(Fill {
+            order_id: OrderId(1),
+            side: Side::Down,
+            direction: OrderDirection::Buy,
+            price: dec!(0.10),
+            filled_qty: dec!(10),
+            cash: dec!(50),
+            generation: Generation(1),
+        }));
+        // 瘸腿侧应取亏损更深的 Down。
+        assert_eq!(engine.lame_side(), Some(Side::Down));
+    }
+
+    #[test]
+    fn advantaged_side_follows_up_mark_price() {
+        let mut engine = engine();
+        // Up mark = 0.60 > 0.5 → 优势 Up。
+        engine.market = MarketSnapshot {
+            up: BookTop {
+                best_bid: Some(dec!(0.58)),
+                best_ask: Some(dec!(0.62)),
+                last_trade: None,
+            },
+            down: BookTop::default(),
+        };
+        assert_eq!(engine.advantaged_side(), Some(Side::Up));
+        // Up mark = 0.30 < 0.5 → 优势 Down。
+        engine.market = MarketSnapshot {
+            up: BookTop {
+                best_bid: Some(dec!(0.28)),
+                best_ask: Some(dec!(0.32)),
+                last_trade: None,
+            },
+            down: BookTop::default(),
+        };
+        assert_eq!(engine.advantaged_side(), Some(Side::Down));
+    }
+
+    #[test]
+    fn cash_guard_blocks_hedge_taker() {
+        let mut engine = engine();
+        engine.market = MarketSnapshot {
+            up: BookTop {
+                best_bid: Some(dec!(0.58)),
+                best_ask: Some(dec!(0.62)),
+                last_trade: None,
+            },
+            down: BookTop::default(),
+        };
+        engine.hedge_phase = HedgePhase::Ev;
+        // 可用现金压到红线 250 以下 → Cash Guard 拦截对冲 Taker，不产指令、不计步。
+        engine.free_cash = dec!(200);
+        let commands = engine.hedge_step();
+        assert!(commands.is_empty());
+        assert_eq!(engine.taker_steps, 0);
     }
 }

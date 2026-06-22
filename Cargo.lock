@@ -47,6 +47,7 @@ dependencies = [
  "risk",
  "rust_decimal",
  "rust_decimal_macros",
+ "serde_json",
  "strategy",
  "tokio",
 ]

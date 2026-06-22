@@ -1,19 +1,20 @@
 //! 模拟撮合后端：实现 [`ExchangeBackend`] 的内存"假交易所"，供策略与事件循环测试。
 //!
-//! 本阶段为**最小可用版**，仅支持 Maker 限价买单：
-//! - 维护内存挂单簿，按行情驱动撮合；
-//! - 成交判定采用**保守口径**——卖一价严格穿越挂单限价（`best_ask < limit`）才成交，
-//!   不高估成交以缓解 Maker 逆向选择（见策略风险修复项 #2）；
-//! - 手续费体现为净入仓股数的扣减（见 `domain::fee::FeeModel`）。
+//! 支持两类成交：
+//! - **Maker 限价买单**：进入挂单簿，由行情驱动撮合——卖一价**严格穿越**挂单限价
+//!   （`best_ask < limit`）才成交，保守口径缓解 Maker 逆向选择（见策略风险修复项 #2）。
+//! - **Taker 即时买单**（对冲用）：提交瞬间以最近行情的卖一价立即成交，不进挂单簿；
+//!   卖一价缺失或高于限价上限则拒单（对冲是"此刻就要补"，吃不到即放弃这一步）。
 //!
-//! Taker 即时成交、卖出撮合、部分成交等留待后续阶段补充。
+//! 手续费体现为净入仓股数的扣减（见 `domain::fee::FeeModel`）。卖出撮合、部分成交等
+//! 留待后续阶段补充。
 
 use crate::backend::ExchangeBackend;
-use crate::event::ExchangeEvent;
+use crate::event::{ExchangeEvent, RejectReason};
 use domain::fee::FeeModel;
 use domain::market::MarketSnapshot;
 use domain::order::{Fill, Order, OrderDirection, OrderId};
-use domain::types::Side;
+use domain::types::{OrderRole, Price, Side};
 use std::collections::HashMap;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
@@ -25,6 +26,8 @@ pub struct Simulator {
     resting_orders: HashMap<OrderId, Order>,
     /// 手续费模型，用于将名义成交股数换算为净入仓股数。
     fee_model: FeeModel,
+    /// 最近一次行情快照，供 Taker 即时成交读取卖一价；初始无行情时为 `None`。
+    last_snapshot: Option<MarketSnapshot>,
     /// 事件回报发送端。
     event_sender: UnboundedSender<ExchangeEvent>,
 }
@@ -36,6 +39,7 @@ impl Simulator {
         let simulator = Self {
             resting_orders: HashMap::new(),
             fee_model,
+            last_snapshot: None,
             event_sender,
         };
         (simulator, event_receiver)
@@ -48,8 +52,10 @@ impl Simulator {
 
     /// 喂入一笔最新市场快照，驱动撮合。
     ///
-    /// 遍历活跃挂单，对满足保守成交条件的买单产出 [`ExchangeEvent::Filled`] 并将其移出挂单簿。
+    /// 先刷新最近行情快照（供后续 Taker 即时成交读取），再遍历活跃挂单，
+    /// 对满足保守成交条件的买单产出 [`ExchangeEvent::Filled`] 并将其移出挂单簿。
     pub fn on_market(&mut self, snapshot: &MarketSnapshot) {
+        self.last_snapshot = Some(*snapshot);
         let filled_ids: Vec<OrderId> = self
             .resting_orders
             .values()
@@ -59,7 +65,8 @@ impl Simulator {
 
         for order_id in filled_ids {
             let order = self.resting_orders.remove(&order_id).expect("挂单必存在");
-            let fill = self.build_fill(&order);
+            // Maker 挂单以其限价成交（保守口径下卖一已穿越限价）。
+            let fill = self.build_fill(&order, order.price);
             // 接收端已关闭时忽略发送错误：模拟后端不因下游停止消费而 panic。
             let _ = self.event_sender.send(ExchangeEvent::Filled(fill));
         }
@@ -76,17 +83,42 @@ impl Simulator {
         }
     }
 
-    /// 依据挂单与手续费模型构造成交回报。
+    /// 处理一笔 Taker 即时买单：以最近行情的卖一价立即成交，不进挂单簿。
     ///
-    /// 成交价取挂单限价，名义股数按费率扣减为净入仓股数，现金为名义股数 × 限价。
-    fn build_fill(&self, order: &Order) -> Fill {
+    /// 卖一价存在且不高于限价上限（`best_ask <= order.price`）则以**卖一价**成交；
+    /// 否则（无行情 / 无卖一 / 价太高）拒单。
+    fn execute_taker(&mut self, order: &Order) {
+        let best_ask = self
+            .last_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.book(order.side).best_ask);
+        match best_ask {
+            Some(ask) if ask <= order.price => {
+                // 以真实卖一价成交（而非限价上限），避免 Taker 成交价被错记为限价。
+                let fill = self.build_fill(order, ask);
+                let _ = self.event_sender.send(ExchangeEvent::Filled(fill));
+            }
+            _ => {
+                let _ = self.event_sender.send(ExchangeEvent::Rejected {
+                    order_id: order.order_id,
+                    reason: RejectReason::InvalidPrice,
+                });
+            }
+        }
+    }
+
+    /// 依据挂单与成交价构造成交回报。
+    ///
+    /// `exec_price` 为实际成交价（Maker 取限价、Taker 取卖一价）；名义股数按角色费率扣减为
+    /// 净入仓股数，现金为名义股数 × 成交价。
+    fn build_fill(&self, order: &Order, exec_price: Price) -> Fill {
         let filled_qty = self.fee_model.net_qty(order.role, order.qty);
-        let cash = order.price * order.qty;
+        let cash = exec_price * order.qty;
         Fill {
             order_id: order.order_id,
             side: order.side,
             direction: order.direction,
-            price: order.price,
+            price: exec_price,
             filled_qty,
             cash,
             generation: order.generation,
@@ -96,7 +128,14 @@ impl Simulator {
 
 impl ExchangeBackend for Simulator {
     fn submit_order(&mut self, order: Order) {
-        self.resting_orders.insert(order.order_id, order);
+        match order.role {
+            // Taker 即时成交（或拒单），不进挂单簿。
+            OrderRole::Taker => self.execute_taker(&order),
+            // Maker 进入挂单簿，等待行情撮合。
+            OrderRole::Maker => {
+                self.resting_orders.insert(order.order_id, order);
+            }
+        }
     }
 
     fn cancel_order(&mut self, order_id: OrderId) {
@@ -210,19 +249,88 @@ mod tests {
     #[test]
     fn taker_fee_reduces_filled_qty() {
         let (mut simulator, mut rx) = Simulator::new(FeeModel::default());
-        // Taker 角色买单，默认 4% 费率。
+        // 先有行情：Up 侧卖一 0.49。
+        simulator.on_market(&snapshot_with_ask(Side::Up, dec!(0.49)));
+        // Taker 买单限价 0.50（上限），提交瞬间即时成交。
         let mut order = maker_buy(1, Side::Up, dec!(0.50), dec!(100));
         order.role = OrderRole::Taker;
         simulator.submit_order(order);
-        simulator.on_market(&snapshot_with_ask(Side::Up, dec!(0.49)));
         match rx.try_recv() {
             Ok(ExchangeEvent::Filled(fill)) => {
-                // 净入仓 100 × 0.96 = 96 股，现金仍为 100 × 0.50 = 50。
+                // 以真实卖一价 0.49 成交（非限价 0.50）：净入仓 100×0.96=96 股，现金 100×0.49=49。
+                assert_eq!(fill.price, dec!(0.49));
                 assert_eq!(fill.filled_qty, dec!(96.00));
-                assert_eq!(fill.cash, dec!(50.00));
+                assert_eq!(fill.cash, dec!(49.00));
             }
             other => panic!("应成交，实际为 {other:?}"),
         }
+        // Taker 不进挂单簿。
+        assert_eq!(simulator.resting_order_count(), 0);
+    }
+
+    #[test]
+    fn taker_fills_when_ask_equals_limit() {
+        let (mut simulator, mut rx) = Simulator::new(FeeModel::zero());
+        // 卖一价恰等于 Taker 限价上限 0.50 → 命中（Taker 用 <=，区别于 Maker 严格穿越）。
+        simulator.on_market(&snapshot_with_ask(Side::Up, dec!(0.50)));
+        let mut order = maker_buy(1, Side::Up, dec!(0.50), dec!(100));
+        order.role = OrderRole::Taker;
+        simulator.submit_order(order);
+        match rx.try_recv() {
+            Ok(ExchangeEvent::Filled(fill)) => assert_eq!(fill.price, dec!(0.50)),
+            other => panic!("应成交，实际为 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn taker_rejected_when_ask_above_limit() {
+        let (mut simulator, mut rx) = Simulator::new(FeeModel::zero());
+        // 卖一价 0.55 高于 Taker 限价上限 0.50 → 拒单，不成交不挂起。
+        simulator.on_market(&snapshot_with_ask(Side::Up, dec!(0.55)));
+        let mut order = maker_buy(1, Side::Up, dec!(0.50), dec!(100));
+        order.role = OrderRole::Taker;
+        simulator.submit_order(order);
+        assert_eq!(
+            rx.try_recv(),
+            Ok(ExchangeEvent::Rejected {
+                order_id: OrderId(1),
+                reason: RejectReason::InvalidPrice,
+            })
+        );
+        assert_eq!(simulator.resting_order_count(), 0);
+    }
+
+    #[test]
+    fn taker_rejected_when_no_snapshot() {
+        let (mut simulator, mut rx) = Simulator::new(FeeModel::zero());
+        // 尚无任何行情（last_snapshot=None）→ Taker 无从取卖一价 → 拒单。
+        let mut order = maker_buy(1, Side::Up, dec!(0.50), dec!(100));
+        order.role = OrderRole::Taker;
+        simulator.submit_order(order);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ExchangeEvent::Rejected {
+                reason: RejectReason::InvalidPrice,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn taker_rejected_when_side_has_no_ask() {
+        let (mut simulator, mut rx) = Simulator::new(FeeModel::zero());
+        // 行情只给了 Up 侧卖一，Down 侧无卖一 → Down 的 Taker 拒单。
+        simulator.on_market(&snapshot_with_ask(Side::Up, dec!(0.40)));
+        let mut order = maker_buy(1, Side::Down, dec!(0.60), dec!(100));
+        order.role = OrderRole::Taker;
+        simulator.submit_order(order);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ExchangeEvent::Rejected {
+                reason: RejectReason::InvalidPrice,
+                ..
+            })
+        ));
     }
 
     #[test]

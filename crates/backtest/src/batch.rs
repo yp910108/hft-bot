@@ -189,6 +189,9 @@ mod tests {
             },
             engine_config: EngineConfig {
                 grid_maker_pool: CapitalPools::with_default_ratios(total_capital).grid_maker(),
+                hedge_attack_pool: CapitalPools::with_default_ratios(total_capital).hedge_attack(),
+                hedge_step_fraction: dec!(0.2),
+                max_taker_steps: 5,
                 constraints: OrderConstraints::default(),
             },
         };
