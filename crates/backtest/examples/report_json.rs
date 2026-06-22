@@ -68,7 +68,7 @@ fn make_config(total_capital: Decimal) -> (EngineConfig, Thresholds) {
     let pools = CapitalPools::with_default_ratios(total_capital);
     let thresholds = Thresholds {
         hedge_loss_trigger: dec!(30),
-        hedge_safety_price: dec!(0.5),
+        hedge_min_qty: dec!(100),
         profit_target: dec!(15),
     };
     let config = EngineConfig {
@@ -94,6 +94,7 @@ fn run_with_log(
     market: &backtest::market::Market,
     title: String,
     condition_id: String,
+    base_time: &str,
     total_capital: Decimal,
     fee_model: FeeModel,
 ) -> serde_json::Value {
@@ -119,7 +120,7 @@ fn run_with_log(
             engine.handle_event(ExchangeEvent::BookUpdate(*first)),
         );
         dispatch(&mut simulator, engine.start());
-        drain_and_record(&mut simulator, &mut engine, &mut events, &mut ops, tick);
+        drain_and_record(&mut simulator, &mut engine, &mut events, &mut ops, tick, base_time);
         tick += 1;
     }
 
@@ -130,7 +131,7 @@ fn run_with_log(
             engine.handle_event(ExchangeEvent::BookUpdate(*snapshot)),
         );
         simulator.on_market(snapshot);
-        drain_and_record(&mut simulator, &mut engine, &mut events, &mut ops, tick);
+        drain_and_record(&mut simulator, &mut engine, &mut events, &mut ops, tick, base_time);
         tick += 1;
     }
 
@@ -182,6 +183,7 @@ fn drain_and_record(
     events: &mut UnboundedReceiver<ExchangeEvent>,
     ops: &mut Vec<OpRecord>,
     tick: usize,
+    base_time: &str,
 ) {
     while let Ok(event) = events.try_recv() {
         if let ExchangeEvent::Filled(ref fill) = event {
@@ -190,8 +192,32 @@ fn drain_and_record(
                 Side::Down => "DN",
             };
             let price = decimal_to_f64(fill.price);
-            let size = decimal_to_f64(fill.filled_qty);
-            let time = format!("T+{:04}s", tick);
+            // size 用 gross qty(= cash / price),即原始下单股数(扣费前),
+            // 因为 _build_rows 会自己用 price×size 算 cost。
+            let gross_size = if price > 0.0 {
+                decimal_to_f64(fill.cash) / price
+            } else {
+                decimal_to_f64(fill.filled_qty)
+            };
+            // 时间: 基于文件名的场次开始时间 + tick 秒偏移,格式 HH:MM:SS。
+            let base_mins: usize = base_time
+                .split(':')
+                .next()
+                .unwrap_or("0")
+                .parse()
+                .unwrap_or(0)
+                * 60
+                + base_time
+                    .split(':')
+                    .nth(1)
+                    .unwrap_or("0")
+                    .parse::<usize>()
+                    .unwrap_or(0);
+            let total_secs = base_mins * 60 + tick;
+            let h = (total_secs / 3600) % 24;
+            let m = (total_secs % 3600) / 60;
+            let s = total_secs % 60;
+            let time = format!("{:02}:{:02}:{:02}", h, m, s);
 
             // 喂给 engine(更新 ledger)。
             let commands = engine.handle_event(event);
@@ -207,7 +233,7 @@ fn drain_and_record(
                 time,
                 direction,
                 price,
-                size,
+                size: gross_size,
                 up_qty,
                 up_cost,
                 dn_qty,
@@ -277,17 +303,25 @@ fn main() {
             }
         };
 
-        // 从文件名构造 title 和 condition_id。
+        // 从文件名构造 title、condition_id 和 base_time。
+        // 文件名格式: "07_30_508877" → 时间 "07:30", ID "508877"
         let filename = path.file_stem().unwrap_or_default().to_string_lossy();
         let date_dir = path
             .parent()
             .and_then(|p| p.file_name())
             .unwrap_or_default()
             .to_string_lossy();
-        let title = format!("BTC 15m - {} {}", date_dir, filename.replace('_', ":"));
+        // 解析 base_time: "07_30_508877" → "07:30"
+        let parts: Vec<&str> = filename.split('_').collect();
+        let base_time = if parts.len() >= 2 {
+            format!("{}:{}", parts[0], parts[1])
+        } else {
+            "00:00".to_string()
+        };
+        let title = format!("BTC 15m - {} {}", date_dir, base_time);
         let condition_id = format!("rust_{}", filename);
 
-        let record = run_with_log(&market, title, condition_id, total_capital, fee_model);
+        let record = run_with_log(&market, title, condition_id, &base_time, total_capital, fee_model);
         records.push(record);
 
         if (i + 1) % 100 == 0 {

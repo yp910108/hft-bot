@@ -419,7 +419,7 @@ mod tests {
         let total_capital = dec!(1000);
         let thresholds = Thresholds {
             hedge_loss_trigger: dec!(30),
-            hedge_safety_price: dec!(0.5),
+            hedge_min_qty: dec!(100),
             profit_target: dec!(15),
         };
         let pools = CapitalPools::with_default_ratios(total_capital);
@@ -564,8 +564,8 @@ mod tests {
         // Up 主战场 0.40，对面 Down Ask 0.65。
         engine.handle_event(book_update_both(dec!(0.40), dec!(0.65)));
         engine.start(); // 世代 → 1
-        // Up 侧买入成交 100 股、花费 40 → 触发跨侧重算。
-        let commands = engine.handle_event(current_fill(Side::Up, dec!(0.40), dec!(100), dec!(40)));
+        // Up 侧买入成交 50 股、花费 20 → 总持仓 50 < hedge_min_qty 100，不触发对冲，走跨侧重算。
+        let commands = engine.handle_event(current_fill(Side::Up, dec!(0.40), dec!(50), dec!(20)));
         // 重算应撤销对面 Down 侧全部活跃挂单。
         assert!(commands.contains(&Command::CancelSide(Side::Down)));
         // 并产出对面 Down 的配对买单（配对价 1-0.40-0.02=0.58 < Down Ask 0.65 → 直接挂）。
@@ -581,7 +581,8 @@ mod tests {
         // 对面 Down Ask 仅 0.55，配对价 0.58 ≥ 0.55 → 挂起，不立即下发 Down 单。
         engine.handle_event(book_update_both(dec!(0.40), dec!(0.55)));
         engine.start();
-        let commands = engine.handle_event(current_fill(Side::Up, dec!(0.40), dec!(100), dec!(40)));
+        // 50 股成交 → 总持仓 50 < 100，不触发对冲。
+        let commands = engine.handle_event(current_fill(Side::Up, dec!(0.40), dec!(50), dec!(20)));
         assert!(!commands.iter().any(|c| matches!(
             c,
             Command::SubmitOrder(o) if o.side == Side::Down

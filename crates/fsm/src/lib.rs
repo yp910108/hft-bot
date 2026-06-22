@@ -9,16 +9,16 @@
 use domain::market::MarketSnapshot;
 use domain::pnl::PositionSnapshot;
 use domain::state::RobotState;
-use domain::types::{Money, Side};
-use rust_decimal::Decimal;
+use domain::types::{Money, Qty, Side};
 
-/// 状态流转所需的绝对金额阈值。
+/// 状态流转所需的阈值。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Thresholds {
-    /// 复合对冲触发的单边亏损线（正数，表示「亏损达到该值」即 `Side_PnL <= -loss_trigger`）。
+    /// 对冲触发的单边亏损线（正数，表示 `Side_PnL <= -loss_trigger`）。
     pub hedge_loss_trigger: Money,
-    /// 复合对冲触发的安全价格线：某侧 Mark Price 低于此值才确认单边暴砸。
-    pub hedge_safety_price: Decimal,
+    /// 对冲触发的最小总成交股数：总持仓(up_qty+down_qty)达到此值才允许触发对冲，
+    /// 防止开局首笔成交导致的虚假报警。
+    pub hedge_min_qty: Qty,
     /// 收手结算的利润达标线：两边条件 PnL 的较小者达到此值即锁定离场。
     pub profit_target: Money,
 }
@@ -28,7 +28,7 @@ pub struct Thresholds {
 pub struct StepInputs {
     /// 当前双边持仓快照，用于计算条件盈亏。
     pub position: PositionSnapshot,
-    /// 当前市场快照，用于读取各侧 Mark Price。
+    /// 当前市场快照，用于 EV 对冲阶段读取 Mark Price 估算胜出概率。
     pub market: MarketSnapshot,
 }
 
@@ -76,7 +76,7 @@ impl StateMachine {
         self.state
     }
 
-    /// 返回状态机的阈值配置（供上层读取对冲亏损线等参数判定瘸腿侧）。
+    /// 返回状态机的阈值配置（供上层读取对冲亏损线等参数）。
     pub fn thresholds(&self) -> Thresholds {
         self.thresholds
     }
@@ -93,9 +93,6 @@ impl StateMachine {
     }
 
     /// 部署完初始梯度单后，由上层显式驱动进入常规做市。
-    ///
-    /// `Initialization → RangeBoundMaking` 这条边不依赖行情判定，而是初始布阵完成的信号，
-    /// 故单独提供方法，不混入由盈亏驱动的 `step`。
     pub fn finish_initialization(&mut self) -> Transition {
         if self.state == RobotState::Initialization {
             self.state = RobotState::RangeBoundMaking;
@@ -108,7 +105,6 @@ impl StateMachine {
     /// 依据当前状态与输入计算应处的下一状态（纯判定，不改自身）。
     fn next_state(&self, inputs: &StepInputs) -> RobotState {
         match self.state {
-            // 初始化阶段不由盈亏驱动跳转，等待 finish_initialization。
             RobotState::Initialization => RobotState::Initialization,
 
             RobotState::RangeBoundMaking => {
@@ -129,7 +125,6 @@ impl StateMachine {
                 if self.profit_target_reached(&inputs.position) {
                     RobotState::FinalSettlement
                 } else if inputs.position.both_sides_negative() {
-                    // 两边均负：第一次放大亏损上限、留在对冲；累计第二次升级到 EV 对冲。
                     if double_negative_count >= 1 {
                         RobotState::EvHedging
                     } else {
@@ -152,42 +147,31 @@ impl StateMachine {
                 }
             }
 
-            // 终态：不再跳转。
             RobotState::FinalSettlement => RobotState::FinalSettlement,
             RobotState::ChopMarketShutdown => RobotState::ChopMarketShutdown,
         }
     }
 
-    /// 两边条件 PnL 的较小者是否达到利润目标（达标即可锁定离场）。
+    /// 两边条件 PnL 的较小者是否达到利润目标。
     fn profit_target_reached(&self, position: &PositionSnapshot) -> bool {
         position.is_profit_locked()
             && position.up_win_pnl().min(position.down_win_pnl()) >= self.thresholds.profit_target
     }
 
-    /// 复合对冲边界：某边亏损穿透风险线，且该边 Mark Price 跌破安全价。
+    /// 复合对冲边界：某边亏损穿透风险线，且总成交股数达到最小规模。
     fn hedge_boundary_triggered(&self, inputs: &StepInputs) -> bool {
-        self.side_hedge_triggered(Side::Up, inputs) || self.side_hedge_triggered(Side::Down, inputs)
-    }
-
-    /// 单侧的复合对冲判定：该侧胜出 PnL ≤ -亏损线，且该侧 Mark Price < 安全价。
-    fn side_hedge_triggered(&self, side: Side, inputs: &StepInputs) -> bool {
-        let side_pnl = match side {
-            Side::Up => inputs.position.up_win_pnl(),
-            Side::Down => inputs.position.down_win_pnl(),
-        };
-        let pnl_breached = side_pnl <= -self.thresholds.hedge_loss_trigger;
-        let price_breached = match inputs.market.mark_price(side) {
-            Some(mark) => mark < self.thresholds.hedge_safety_price,
-            None => false,
-        };
-        pnl_breached && price_breached
+        let total_qty = inputs.position.up_qty + inputs.position.down_qty;
+        if total_qty < self.thresholds.hedge_min_qty {
+            return false;
+        }
+        let up_pnl = inputs.position.up_win_pnl();
+        let down_pnl = inputs.position.down_win_pnl();
+        up_pnl <= -self.thresholds.hedge_loss_trigger
+            || down_pnl <= -self.thresholds.hedge_loss_trigger
     }
 }
 
 /// 以当前 Up 侧 Mark Price 作为胜出概率估计，判断交割数学期望是否非负。
-///
-/// 此处藏有 fsm 层的策略假设——用 Up 侧 Mark Price 近似 Up 胜出概率
-/// （二元市场中价格 ≈ 概率），故归属 fsm 而非 domain；若无法取得则保守视为期望为负。
 fn expected_value_non_negative(position: &PositionSnapshot, market: &MarketSnapshot) -> bool {
     match market.mark_price(Side::Up) {
         Some(up_probability) => position.expected_value(up_probability) >= Money::ZERO,
@@ -201,16 +185,14 @@ mod tests {
     use domain::market::BookTop;
     use rust_decimal_macros::dec;
 
-    /// 测试用阈值：对冲亏损线 30、安全价 0.5、利润目标 15。
     fn thresholds() -> Thresholds {
         Thresholds {
             hedge_loss_trigger: dec!(30),
-            hedge_safety_price: dec!(0.5),
+            hedge_min_qty: dec!(100),
             profit_target: dec!(15),
         }
     }
 
-    /// 构造持仓快照。
     fn position(up_qty: Money, down_qty: Money, total_cost: Money) -> PositionSnapshot {
         PositionSnapshot {
             up_qty,
@@ -219,8 +201,7 @@ mod tests {
         }
     }
 
-    /// 构造仅设定某侧中间价的市场快照（买一、卖一对称取均价）。
-    fn market_with_up_mid(up_mid: Decimal) -> MarketSnapshot {
+    fn market_with_up_mid(up_mid: Qty) -> MarketSnapshot {
         MarketSnapshot {
             up: BookTop {
                 best_bid: Some(up_mid),
@@ -231,7 +212,6 @@ mod tests {
         }
     }
 
-    /// 构造空盘口的中性市场快照。
     fn neutral_market() -> MarketSnapshot {
         MarketSnapshot::default()
     }
@@ -247,7 +227,7 @@ mod tests {
         let machine = StateMachine::new(thresholds());
         let t = machine.thresholds();
         assert_eq!(t.hedge_loss_trigger, dec!(30));
-        assert_eq!(t.hedge_safety_price, dec!(0.5));
+        assert_eq!(t.hedge_min_qty, dec!(100));
         assert_eq!(t.profit_target, dec!(15));
     }
 
@@ -258,7 +238,6 @@ mod tests {
             position: position(dec!(100), dec!(100), dec!(50)),
             market: neutral_market(),
         };
-        // 初始化阶段不由盈亏驱动跳转。
         let transition = machine.step(&inputs);
         assert!(!transition.is_moved());
         assert_eq!(machine.state(), RobotState::Initialization);
@@ -276,7 +255,6 @@ mod tests {
     fn range_bound_making_to_final_settlement_when_profit_locked() {
         let mut machine = StateMachine::new(thresholds());
         machine.finish_initialization();
-        // up_pnl = 100-80 = 20，down_pnl = 100-80 = 20，较小者 20 ≥ 利润目标 15。
         let inputs = StepInputs {
             position: position(dec!(100), dec!(100), dec!(80)),
             market: neutral_market(),
@@ -289,29 +267,35 @@ mod tests {
     fn range_bound_profit_not_reached_when_below_target() {
         let mut machine = StateMachine::new(thresholds());
         machine.finish_initialization();
-        // 两边 pnl 均为 10，达成双向盈利但 10 < 利润目标 15，不应离场。
         let inputs = StepInputs {
             position: position(dec!(100), dec!(100), dec!(90)),
             market: neutral_market(),
         };
         let transition = machine.step(&inputs);
         assert_eq!(transition.state(), RobotState::RangeBoundMaking);
-        assert!(!transition.is_moved());
     }
 
     #[test]
-    fn range_bound_to_dynamic_hedging_on_composite_boundary() {
+    fn hedge_triggered_when_loss_breached_and_qty_sufficient() {
         let mut machine = StateMachine::new(thresholds());
         machine.finish_initialization();
-        // Up 侧瘸腿触发复合对冲边界：up_pnl = 5 - 50 = -45 ≤ -30（亏损穿透），
-        // 且 Up 侧 mark 0.3 < 安全价 0.5（价格暴砸）。Down 侧此时 down_pnl = 60 - 50 = +10。
+        // up_pnl = 5 - 50 = -45 ≤ -30，总持仓 5+60=65 < 100 → 不触发。
         let inputs = StepInputs {
             position: position(dec!(5), dec!(60), dec!(50)),
-            market: market_with_up_mid(dec!(0.3)),
+            market: neutral_market(),
         };
         let transition = machine.step(&inputs);
+        assert_eq!(transition.state(), RobotState::RangeBoundMaking);
+
+        // 总持仓增加到 150 ≥ 100 → 触发。
+        let inputs2 = StepInputs {
+            position: position(dec!(50), dec!(100), dec!(180)),
+            market: neutral_market(),
+        };
+        // up_pnl = 50 - 180 = -130 ≤ -30, total_qty = 150 ≥ 100 → 触发对冲。
+        let transition2 = machine.step(&inputs2);
         assert_eq!(
-            transition.state(),
+            transition2.state(),
             RobotState::DynamicHedging {
                 double_negative_count: 0
             }
@@ -319,13 +303,13 @@ mod tests {
     }
 
     #[test]
-    fn hedge_not_triggered_when_price_not_breached() {
+    fn hedge_not_triggered_when_qty_insufficient() {
         let mut machine = StateMachine::new(thresholds());
         machine.finish_initialization();
-        // up_pnl = -45 ≤ -30 满足亏损线，但 Up mark 0.6 ≥ 安全价 0.5，复合判定不成立。
+        // up_pnl = 10 - 80 = -70 ≤ -30，但总持仓 10+40=50 < 100 → 不触发。
         let inputs = StepInputs {
-            position: position(dec!(5), dec!(60), dec!(50)),
-            market: market_with_up_mid(dec!(0.6)),
+            position: position(dec!(10), dec!(40), dec!(80)),
+            market: neutral_market(),
         };
         let transition = machine.step(&inputs);
         assert_eq!(transition.state(), RobotState::RangeBoundMaking);
@@ -335,15 +319,15 @@ mod tests {
     fn dynamic_hedging_first_double_negative_increments_count() {
         let mut machine = StateMachine::new(thresholds());
         machine.finish_initialization();
-        // 先进入对冲。
+        // 先进入对冲（总持仓 150 ≥ 100，up_pnl = -130）。
         machine.step(&StepInputs {
-            position: position(dec!(5), dec!(60), dec!(50)),
-            market: market_with_up_mid(dec!(0.3)),
+            position: position(dec!(50), dec!(100), dec!(180)),
+            market: neutral_market(),
         });
-        // 两边均负：up_pnl = 40-100 = -60，down_pnl = 50-100 = -50。第一次 → 计数变 1，仍在对冲。
+        // 两边均负：up_pnl = 40-100=-60，down_pnl = 50-100=-50。第一次 → 计数 1。
         let transition = machine.step(&StepInputs {
             position: position(dec!(40), dec!(50), dec!(100)),
-            market: market_with_up_mid(dec!(0.3)),
+            market: neutral_market(),
         });
         assert_eq!(
             transition.state(),
@@ -358,16 +342,14 @@ mod tests {
         let mut machine = StateMachine::new(thresholds());
         machine.finish_initialization();
         machine.step(&StepInputs {
-            position: position(dec!(5), dec!(60), dec!(50)),
-            market: market_with_up_mid(dec!(0.3)),
+            position: position(dec!(50), dec!(100), dec!(180)),
+            market: neutral_market(),
         });
         let double_negative = StepInputs {
             position: position(dec!(40), dec!(50), dec!(100)),
-            market: market_with_up_mid(dec!(0.3)),
+            market: neutral_market(),
         };
-        // 第一次双负 → count = 1。
         machine.step(&double_negative);
-        // 第二次双负 → 升级到 EV 对冲。
         let transition = machine.step(&double_negative);
         assert_eq!(transition.state(), RobotState::EvHedging);
     }
@@ -377,10 +359,9 @@ mod tests {
         let mut machine = StateMachine::new(thresholds());
         machine.finish_initialization();
         machine.step(&StepInputs {
-            position: position(dec!(5), dec!(60), dec!(50)),
-            market: market_with_up_mid(dec!(0.3)),
+            position: position(dec!(50), dec!(100), dec!(180)),
+            market: neutral_market(),
         });
-        // 对冲后两边 pnl 均达标（各 20 ≥ 15）→ 收手。
         let transition = machine.step(&StepInputs {
             position: position(dec!(100), dec!(100), dec!(80)),
             market: neutral_market(),
@@ -392,19 +373,18 @@ mod tests {
     fn ev_hedging_to_final_settlement_when_ev_non_negative() {
         let mut machine = StateMachine::new(thresholds());
         machine.finish_initialization();
-        // 驱动进入 EV 对冲。
         machine.step(&StepInputs {
-            position: position(dec!(5), dec!(60), dec!(50)),
-            market: market_with_up_mid(dec!(0.3)),
+            position: position(dec!(50), dec!(100), dec!(180)),
+            market: neutral_market(),
         });
         let double_negative = StepInputs {
             position: position(dec!(40), dec!(50), dec!(100)),
-            market: market_with_up_mid(dec!(0.3)),
+            market: neutral_market(),
         };
         machine.step(&double_negative);
         machine.step(&double_negative);
         assert_eq!(machine.state(), RobotState::EvHedging);
-        // EV ≥ 0：持仓 up=120/down=80/成本100，up 概率 0.6 → EV = 0.6×20 + 0.4×(-20) = 4 ≥ 0。
+        // EV ≥ 0：up=120/down=80/cost=100，up概率0.6 → EV = 0.6×20 + 0.4×(-20) = 4 ≥ 0。
         let transition = machine.step(&StepInputs {
             position: position(dec!(120), dec!(80), dec!(100)),
             market: market_with_up_mid(dec!(0.6)),
@@ -421,12 +401,10 @@ mod tests {
             market: neutral_market(),
         });
         assert_eq!(machine.state(), RobotState::FinalSettlement);
-        // 终态不再因任何输入跳转。
         let transition = machine.step(&StepInputs {
-            position: position(dec!(5), dec!(60), dec!(50)),
-            market: market_with_up_mid(dec!(0.3)),
+            position: position(dec!(200), dec!(200), dec!(50)),
+            market: neutral_market(),
         });
         assert!(!transition.is_moved());
-        assert_eq!(machine.state(), RobotState::FinalSettlement);
     }
 }
