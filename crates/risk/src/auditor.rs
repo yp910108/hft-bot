@@ -1,72 +1,74 @@
-//! 现金安全哨兵（Cash Guard）：任何下单前的强制资产审计关卡。
+//! Cash Guard：下单前的现金红线校验。
 //!
-//! 对应策略说明书第一节。任何执行模块在提交订单前必须先经本审计器校验：
-//! 若当前可用现金低于总资金 V 的红线比例（默认 25%），立即拒绝一切新开仓挂单，
-//! 守住底层资金链安全（见架构决策：可用现金由调用方传入，审计器只做校验）。
+//! 规则很简单：可用现金 < 总资金 × 红线比例 → 拒绝一切新开仓。
+//! 红线比例默认等于备用金池比例（25%），也可以设更高。
+//! 审计器本身不管钱在哪，调用方把当前可用现金传进来就行。
 
 use crate::pool::CapitalPools;
 use domain::order::Order;
 use domain::types::Money;
 use rust_decimal::Decimal;
-use rust_decimal_macros::dec;
 
-/// 下单被审计器拒绝的原因。
+/// 拒绝原因。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectReason {
-    /// 可用现金低于 Cash Guard 红线，拒绝一切新开仓。
+    /// 现金低于红线，不让开新仓。
     CashGuardBlocked,
 }
 
-/// 一次下单审计的结果。
+/// 审计结果：通过或拒绝。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Approval {
-    /// 通过审计，允许下单。
+    /// 通过，可以下单。
     Approved,
-    /// 未通过审计，附带拒绝原因。
+    /// 被拒，附带原因。
     Rejected(RejectReason),
 }
 
 impl Approval {
-    /// 是否通过审计。
+    /// 是否通过。
     pub fn is_approved(self) -> bool {
         matches!(self, Approval::Approved)
     }
 }
 
-/// 资产审计器：执行 Cash Guard 校验。
+/// Cash Guard 审计器。
 #[derive(Debug, Clone, Copy)]
 pub struct RiskAuditor {
-    /// 三资金池（含总资金 V）。
     pools: CapitalPools,
-    /// Cash Guard 红线比例（相对总资金 V），低于此比例的可用现金即触发拦截。
+    /// 红线比例（相对总资金），低于这个比例的现金就拦截。
     cash_guard_ratio: Decimal,
 }
 
 impl RiskAuditor {
-    /// 以指定资金池与红线比例创建审计器。
+    /// 创建审计器。red_line 比例必须 >= 备用金池比例，否则 panic。
     pub fn new(pools: CapitalPools, cash_guard_ratio: Decimal) -> Self {
+        assert!(
+            cash_guard_ratio >= pools.ratios().reserve,
+            "cash_guard_ratio({}) 必须 >= reserve 比例({})",
+            cash_guard_ratio,
+            pools.ratios().reserve
+        );
         Self {
             pools,
             cash_guard_ratio,
         }
     }
 
-    /// 以默认 25% 红线比例创建审计器。
+    /// 用备用金池比例当红线（最低有效配置）。
     pub fn with_default_guard(pools: CapitalPools) -> Self {
-        Self::new(pools, dec!(0.25))
+        Self::new(pools, pools.ratios().reserve)
     }
 
-    /// Cash Guard 红线的绝对金额 = 红线比例 × 总资金 V。
-    pub fn cash_guard_floor(&self) -> Money {
+    /// 红线的绝对金额 = 比例 × 总资金。
+    pub fn cash_guard(&self) -> Money {
         self.pools.total_capital() * self.cash_guard_ratio
     }
 
-    /// 审计一笔新开仓订单。
-    ///
-    /// 若可用现金 `free_cash` 低于 Cash Guard 红线，拒绝下单；否则通过。
-    /// `_order` 暂未参与判定（本阶段仅做现金红线校验），保留以备后续按池限额扩展。
+    /// 审计一笔下单：现金低于红线就拒绝，否则放行。
+    /// `_order` 目前没用到，留着以后做按池限额扩展。
     pub fn approve(&self, _order: &Order, free_cash: Money) -> Approval {
-        if free_cash < self.cash_guard_floor() {
+        if free_cash < self.cash_guard() {
             Approval::Rejected(RejectReason::CashGuardBlocked)
         } else {
             Approval::Approved
@@ -79,6 +81,7 @@ mod tests {
     use super::*;
     use domain::order::{Generation, OrderDirection, OrderId};
     use domain::types::{OrderRole, Side};
+    use rust_decimal_macros::dec;
 
     /// 构造一笔测试订单（内容不影响 Cash Guard 判定）。
     fn sample_order() -> Order {
@@ -99,8 +102,8 @@ mod tests {
     }
 
     #[test]
-    fn cash_guard_floor_is_ratio_times_capital() {
-        assert_eq!(auditor().cash_guard_floor(), dec!(250));
+    fn cash_guard_is_ratio_times_capital() {
+        assert_eq!(auditor().cash_guard(), dec!(250));
     }
 
     #[test]
@@ -124,5 +127,13 @@ mod tests {
         // 边界：可用现金恰等于红线 250，不低于红线 → 通过。
         let approval = auditor().approve(&sample_order(), dec!(250));
         assert_eq!(approval, Approval::Approved);
+    }
+
+    #[test]
+    #[should_panic(expected = "cash_guard_ratio")]
+    fn panics_when_guard_ratio_below_reserve() {
+        let pools = CapitalPools::with_default_ratios(dec!(1000));
+        // reserve 比例 = 0.25，设 guard = 0.20 → 应 panic。
+        RiskAuditor::new(pools, dec!(0.20));
     }
 }

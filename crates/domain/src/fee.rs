@@ -1,27 +1,27 @@
-//! 手续费模型：统一描述 Maker / Taker 的费率，并将其换算为净到手股数。
+//! 手续费模型：按角色（Maker/Taker）扣减到手股数。
 //!
-//! 费率抽象为可配置参数，实测 Taker 约 4%、Maker 0%。
+//! 实测 Taker 费率约 4%，Maker 为 0%。
 //!
-//! **扣费口径**：手续费体现为到手股数的扣减，而非额外扣减现金。
-//! 即下单 `gross_qty` 股，实际入仓 `gross_qty × (1 - rate)` 股，所花现金仍为 `gross_qty × price`。
-//! 交割时每股兑付 1 美元，故股数损耗直接决定回收金额。
+//! 扣费方式：不额外扣现金，而是减少到手股数。
+//! 下单 100 股实际入仓 100×(1-费率) 股，花的钱不变仍是 100×价格。
+//! 交割时每股值 1 美元，所以少拿的股数就是实际损失。
 
 use crate::types::{OrderRole, Qty};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
 
-/// 手续费模型，描述按成交股数比例扣减的 Maker / Taker 费率。
+/// 手续费模型，存放 Maker 和 Taker 各自的费率。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeeModel {
-    /// Maker（被动挂单）费率，例如 `0.00` 表示零费。
+    /// Maker 费率，例如 `0.00` 表示免费。
     pub maker_fee_rate: Decimal,
-    /// Taker（主动吃单）费率，例如 `0.04` 表示 4%。
+    /// Taker 费率，例如 `0.04` 表示 4%。
     pub taker_fee_rate: Decimal,
 }
 
 impl FeeModel {
-    /// 构造一个零手续费模型（Maker 与 Taker 均为 0）。
+    /// 创建零费率模型（Maker 和 Taker 都不收费）。
     pub fn zero() -> Self {
         Self {
             maker_fee_rate: Decimal::ZERO,
@@ -29,7 +29,7 @@ impl FeeModel {
         }
     }
 
-    /// 返回指定角色适用的费率。
+    /// 查询指定角色的费率。
     pub fn rate_for(&self, role: OrderRole) -> Decimal {
         match role {
             OrderRole::Maker => self.maker_fee_rate,
@@ -37,17 +37,17 @@ impl FeeModel {
         }
     }
 
-    /// 计算扣除手续费后的净到手股数 = `gross_qty × (1 - rate)`。
+    /// 算出扣完手续费后实际到手的股数 = `gross_qty × (1 - 费率)`。
     ///
-    /// `gross_qty` 为下单成交的名义股数，返回实际入仓的净股数。
-    /// 所花现金不受影响，仍为 `gross_qty × price`，由调用方单独记账。
+    /// `gross_qty` 是名义成交股数，返回值是真正入仓的净股数。
+    /// 花的钱不在这里算，调用方自己记账。
     pub fn net_qty(&self, role: OrderRole, gross_qty: Qty) -> Qty {
         gross_qty * (Decimal::ONE - self.rate_for(role))
     }
 }
 
 impl Default for FeeModel {
-    /// 默认采用实测确认的 Taker 4%、Maker 0%（略偏保守口径）。
+    /// 默认值：Taker 4%、Maker 0%（实测确认，偏保守）。
     fn default() -> Self {
         Self {
             maker_fee_rate: Decimal::ZERO,
@@ -78,7 +78,7 @@ mod tests {
     #[test]
     fn taker_net_qty_deducts_rate_from_shares() {
         let model = FeeModel::default();
-        // 下单 100 股，4% Taker 费 → 净入仓 100 × 0.96 = 96 股。
+        // 下单 100 股，Taker 4% → 实际入仓 100 × 0.96 = 96 股。
         assert_eq!(model.net_qty(OrderRole::Taker, dec!(100)), dec!(96.00));
     }
 

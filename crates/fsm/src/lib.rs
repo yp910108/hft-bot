@@ -1,48 +1,44 @@
-//! 有限状态机层：策略的「大脑」，定义状态流转规则与对冲触发判定。
+//! 策略状态机：根据持仓盈亏决定当前该做市、对冲还是收手。
 //!
-//! 纯逻辑、不触碰任何 IO。状态机由交易所成交事件驱动；
-//! 每收到一次输入即调用 [`StateMachine::step`] 评估是否跳转。
-//!
-//! 阈值一律以绝对金额传入（由上层把相对总资金的比例换算为绝对值），
-//! 状态机本身不感知资金规模与比例。
+//! 纯逻辑，不碰 IO。上层每次喂入持仓快照，调用 [`StateMachine::step`] 判断要不要跳状态。
+//! 阈值以绝对金额传入，状态机不关心总资金多大。
 
 use domain::market::MarketSnapshot;
 use domain::pnl::PositionSnapshot;
 use domain::state::RobotState;
 use domain::types::{Money, Qty, Side};
 
-/// 状态流转所需的阈值。
+/// 状态跳转用到的几个门槛值。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Thresholds {
-    /// 对冲触发的单边亏损线（正数，表示 `Side_PnL <= -loss_trigger`）。
+    /// 单边亏多少钱就触发对冲（正数）。
     pub hedge_loss_trigger: Money,
-    /// 对冲触发的最小总成交股数：总持仓(up_qty+down_qty)达到此值才允许触发对冲，
-    /// 防止开局首笔成交导致的虚假报警。
+    /// 总持仓（up+down）至少要这么多股才允许触发对冲，防止刚开局就误报。
     pub hedge_min_qty: Qty,
-    /// 收手结算的利润达标线：两边条件 PnL 的较小者达到此值即锁定离场。
+    /// 两边条件 PnL 的较小者达到这个数就收手结算。
     pub profit_target: Money,
 }
 
-/// 单步评估所需的输入快照。
+/// 每次 step 需要的输入：当前持仓和盘口。
 #[derive(Debug, Clone, Copy)]
 pub struct StepInputs {
-    /// 当前双边持仓快照，用于计算条件盈亏。
+    /// 当前持仓，用来算盈亏。
     pub position: PositionSnapshot,
-    /// 当前市场快照，用于 EV 对冲阶段读取 Mark Price 估算胜出概率。
+    /// 当前盘口，EV 对冲阶段用它估算胜出概率。
     pub market: MarketSnapshot,
 }
 
-/// 一次 `step` 的结果：状态是否发生跳转。
+/// step 的返回值：告诉调用方状态有没有变。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transition {
-    /// 状态未变。
+    /// 没变。
     Unchanged(RobotState),
-    /// 状态已跳转，携带新状态。
+    /// 跳了，新状态在里面。
     Moved(RobotState),
 }
 
 impl Transition {
-    /// 取跳转后的状态（无论是否变化）。
+    /// 取当前状态，不管有没有跳转。
     pub fn state(self) -> RobotState {
         match self {
             Transition::Unchanged(state) | Transition::Moved(state) => state,
@@ -55,7 +51,7 @@ impl Transition {
     }
 }
 
-/// 策略有限状态机：持有当前状态，依据输入评估并执行流转。
+/// 策略状态机：记住当前状态，每次喂入数据就判断要不要跳。
 #[derive(Debug, Clone)]
 pub struct StateMachine {
     state: RobotState,
@@ -63,7 +59,7 @@ pub struct StateMachine {
 }
 
 impl StateMachine {
-    /// 以初始状态 [`RobotState::Initialization`] 创建状态机。
+    /// 创建状态机，初始状态为 [`RobotState::Initialization`]。
     pub fn new(thresholds: Thresholds) -> Self {
         Self {
             state: RobotState::default(),
@@ -71,17 +67,17 @@ impl StateMachine {
         }
     }
 
-    /// 返回当前状态。
+    /// 当前状态。
     pub fn state(&self) -> RobotState {
         self.state
     }
 
-    /// 返回状态机的阈值配置（供上层读取对冲亏损线等参数）。
+    /// 读取阈值配置。
     pub fn thresholds(&self) -> Thresholds {
         self.thresholds
     }
 
-    /// 依据输入评估流转，更新并返回结果。
+    /// 喂入一次数据，判断要不要跳状态，跳了就更新自身。
     pub fn step(&mut self, inputs: &StepInputs) -> Transition {
         let next = self.next_state(inputs);
         if next != self.state {
@@ -92,7 +88,7 @@ impl StateMachine {
         }
     }
 
-    /// 部署完初始梯度单后，由上层显式驱动进入常规做市。
+    /// 初始挂单完成后，上层调用这个方法让状态机进入正式做市。
     pub fn finish_initialization(&mut self) -> Transition {
         if self.state == RobotState::Initialization {
             self.state = RobotState::RangeBoundMaking;
@@ -102,7 +98,7 @@ impl StateMachine {
         }
     }
 
-    /// 依据当前状态与输入计算应处的下一状态（纯判定，不改自身）。
+    /// 根据当前状态和输入，算出下一个状态应该是什么（不改自身）。
     fn next_state(&self, inputs: &StepInputs) -> RobotState {
         match self.state {
             RobotState::Initialization => RobotState::Initialization,
@@ -110,7 +106,7 @@ impl StateMachine {
             RobotState::RangeBoundMaking => {
                 if self.profit_target_reached(&inputs.position) {
                     RobotState::FinalSettlement
-                } else if self.hedge_boundary_triggered(inputs) {
+                } else if self.hedge_boundary_triggered(&inputs.position) {
                     RobotState::DynamicHedging {
                         double_negative_count: 0,
                     }
@@ -152,20 +148,20 @@ impl StateMachine {
         }
     }
 
-    /// 两边条件 PnL 的较小者是否达到利润目标。
+    /// 两边条件 PnL 的较小者是否够到利润目标。
     fn profit_target_reached(&self, position: &PositionSnapshot) -> bool {
         position.is_profit_locked()
             && position.up_win_pnl().min(position.down_win_pnl()) >= self.thresholds.profit_target
     }
 
-    /// 复合对冲边界：某边亏损穿透风险线，且总成交股数达到最小规模。
-    fn hedge_boundary_triggered(&self, inputs: &StepInputs) -> bool {
-        let total_qty = inputs.position.up_qty + inputs.position.down_qty;
+    /// 是否该触发对冲：某边亏损穿线，且总持仓够大（排除开局误报）。
+    fn hedge_boundary_triggered(&self, position: &PositionSnapshot) -> bool {
+        let total_qty = position.up_qty + position.down_qty;
         if total_qty < self.thresholds.hedge_min_qty {
             return false;
         }
-        let up_pnl = inputs.position.up_win_pnl();
-        let down_pnl = inputs.position.down_win_pnl();
+        let up_pnl = position.up_win_pnl();
+        let down_pnl = position.down_win_pnl();
         up_pnl <= -self.thresholds.hedge_loss_trigger
             || down_pnl <= -self.thresholds.hedge_loss_trigger
     }
@@ -329,6 +325,7 @@ mod tests {
             position: position(dec!(40), dec!(50), dec!(100)),
             market: neutral_market(),
         });
+        assert!(transition.is_moved());
         assert_eq!(
             transition.state(),
             RobotState::DynamicHedging {

@@ -17,11 +17,10 @@ use risk::pool::CapitalPools;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde_json::json;
-use strategy::GradientLadder;
-use tokio::sync::mpsc::UnboundedReceiver;
-
 use std::fs;
 use std::path::Path;
+use strategy::GradientLadder;
+use tokio::sync::mpsc::UnboundedReceiver;
 
 /// 一笔成交的快照记录。
 struct OpRecord {
@@ -64,7 +63,7 @@ fn decimal_to_f64(d: Decimal) -> f64 {
     d.to_string().parse::<f64>().unwrap_or(0.0)
 }
 
-fn make_config(total_capital: Decimal) -> (EngineConfig, Thresholds) {
+fn make_config(total_capital: Decimal) -> (CapitalPools, Thresholds, EngineConfig) {
     let pools = CapitalPools::with_default_ratios(total_capital);
     let thresholds = Thresholds {
         hedge_loss_trigger: dec!(30),
@@ -78,7 +77,7 @@ fn make_config(total_capital: Decimal) -> (EngineConfig, Thresholds) {
         max_taker_steps: 5,
         constraints: OrderConstraints::default(),
     };
-    (config, thresholds)
+    (pools, thresholds, config)
 }
 
 /// 从 ledger 读取单边成本(qty × average_price)。
@@ -98,8 +97,7 @@ fn run_with_log(
     total_capital: Decimal,
     fee_model: FeeModel,
 ) -> serde_json::Value {
-    let pools = CapitalPools::with_default_ratios(total_capital);
-    let (config, thresholds) = make_config(total_capital);
+    let (pools, thresholds, config) = make_config(total_capital);
     let mut engine = Engine::new(
         total_capital,
         thresholds,
@@ -120,7 +118,14 @@ fn run_with_log(
             engine.handle_event(ExchangeEvent::BookUpdate(*first)),
         );
         dispatch(&mut simulator, engine.start());
-        drain_and_record(&mut simulator, &mut engine, &mut events, &mut ops, tick, base_time);
+        drain_and_record(
+            &mut simulator,
+            &mut engine,
+            &mut events,
+            &mut ops,
+            tick,
+            base_time,
+        );
         tick += 1;
     }
 
@@ -131,7 +136,14 @@ fn run_with_log(
             engine.handle_event(ExchangeEvent::BookUpdate(*snapshot)),
         );
         simulator.on_market(snapshot);
-        drain_and_record(&mut simulator, &mut engine, &mut events, &mut ops, tick, base_time);
+        drain_and_record(
+            &mut simulator,
+            &mut engine,
+            &mut events,
+            &mut ops,
+            tick,
+            base_time,
+        );
         tick += 1;
     }
 
@@ -321,7 +333,14 @@ fn main() {
         let title = format!("BTC 15m - {} {}", date_dir, base_time);
         let condition_id = format!("rust_{}", filename);
 
-        let record = run_with_log(&market, title, condition_id, &base_time, total_capital, fee_model);
+        let record = run_with_log(
+            &market,
+            title,
+            condition_id,
+            &base_time,
+            total_capital,
+            fee_model,
+        );
         records.push(record);
 
         if (i + 1) % 100 == 0 {

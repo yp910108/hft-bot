@@ -1,7 +1,6 @@
-//! 交易所事件：后端异步回报给事件循环的统一消息类型。
+//! 交易所事件：后端异步回报给事件循环的消息。
 //!
-//! 后端既是指令的去处（下单 / 撤单），也是事件的来源（行情 / 成交 / 拒单 / 撤单确认）。
-//! 所有事件收敛为单一枚举 [`ExchangeEvent`]，由单写者事件循环串行消费。
+//! 行情、成交、拒单、撤单确认，全部收敛为一个枚举 [`ExchangeEvent`]，由事件循环串行消费。
 
 use domain::market::MarketSnapshot;
 use domain::order::{Fill, OrderId};
@@ -9,31 +8,31 @@ use domain::order::{Fill, OrderId};
 /// 订单被拒的原因。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectReason {
-    /// 可用现金不足，无法承接该笔下单。
+    /// 现金不够下这笔单。
     InsufficientCash,
-    /// 下单量低于交易所最小下单量。
+    /// 下单量低于交易所最小量。
     BelowMinOrderSize,
-    /// 价格不符合交易所最小报价单位（tick size）。
+    /// 价格不符合最小 tick。
     InvalidPrice,
-    /// 被风控的现金安全哨兵（Cash Guard）拦截。
+    /// 被 Cash Guard 红线拦截。
     CashGuardBlocked,
 }
 
-/// 交易所异步回报的事件。
+/// 交易所异步回报事件。
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExchangeEvent {
-    /// 盘口顶部发生变化，携带最新双边市场快照。
+    /// 盘口变化，带最新双边快照。
     BookUpdate(MarketSnapshot),
-    /// 一笔成交回报。
+    /// 成交回报。
     Filled(Fill),
-    /// 一笔下单被拒。
+    /// 下单被拒。
     Rejected {
-        /// 被拒订单的标识。
+        /// 被拒订单 ID。
         order_id: OrderId,
-        /// 被拒原因。
+        /// 拒绝原因。
         reason: RejectReason,
     },
-    /// 一笔撤单已被交易所确认。
+    /// 撤单确认。
     Canceled(OrderId),
 }
 
@@ -56,7 +55,7 @@ mod tests {
             generation: Generation::new(),
         };
         let event = ExchangeEvent::Filled(fill);
-        // 成交事件应原样携带 Fill 数据，供账本更新使用。
+        // 成交事件应原样携带 Fill 数据，账本靠它更新。
         match event {
             ExchangeEvent::Filled(f) => assert_eq!(f, fill),
             _ => panic!("应为 Filled 事件"),

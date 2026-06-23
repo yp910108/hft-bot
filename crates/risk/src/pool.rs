@@ -1,38 +1,34 @@
-//! 三资金池划拨：开盘时按总资金 V 将资本切分为三个独立额度上限。
+//! 三资金池划拨：把总资金切成三份，各管各的。
 //!
-//! 对应策略说明书第一节「资金池精细化治理」。本模块只负责依据比例算出各池的
-//! **额度上限**（见架构决策：池 = 额度上限，不单独记每池余额，以免与账本重复记账）。
+//! 本模块只算各池的**额度上限**，不记余额（余额由账本管，避免重复记账）。
 //!
-//! | 子资金池 | 默认比例 | 用途 |
+//! | 池 | 默认比例 | 干什么 |
 //! | --- | --- | --- |
-//! | 备用金池 Reserve | 25% | 红线，日常禁动 |
-//! | 核心做市池 Grid_Maker | 52.5% | Maker 梯度铺单 |
-//! | 动量对冲池 Hedge_Attack | 22.5% | Taker 对冲 |
+//! | 备用金 Reserve | 25% | 红线，日常不碰 |
+//! | 做市池 Grid_Maker | 52.5% | Maker 梯度铺单 |
+//! | 对冲池 Hedge_Attack | 22.5% | Taker 追买 |
 
 use domain::types::Money;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
-/// 三资金池的划拨比例（相对总资金 V）。三者之和应为 1。
+/// 三池的比例配置。三者之和必须等于 1。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PoolRatios {
-    /// 备用金池比例。
     pub reserve: Decimal,
-    /// 核心做市池比例。
     pub grid_maker: Decimal,
-    /// 动量对冲池比例。
     pub hedge_attack: Decimal,
 }
 
 impl PoolRatios {
-    /// 三个比例之和。
+    /// 三个比例加起来。
     pub fn sum(&self) -> Decimal {
         self.reserve + self.grid_maker + self.hedge_attack
     }
 }
 
 impl Default for PoolRatios {
-    /// 策略默认划拨：备用金 25%、核心做市 52.5%、动量对冲 22.5%。
+    /// 默认：备用金 25%、做市 52.5%、对冲 22.5%。
     fn default() -> Self {
         Self {
             reserve: dec!(0.25),
@@ -42,24 +38,18 @@ impl Default for PoolRatios {
     }
 }
 
-/// 三资金池的额度上限（按总资金 V 与比例算出的绝对金额）。
+/// 三池的绝对额度（= 总资金 × 比例）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CapitalPools {
-    /// 总资金 V。
     total_capital: Money,
-    /// 备用金池额度上限。
+    ratios: PoolRatios,
     reserve: Money,
-    /// 核心做市池额度上限。
     grid_maker: Money,
-    /// 动量对冲池额度上限。
     hedge_attack: Money,
 }
 
 impl CapitalPools {
-    /// 按总资金与划拨比例切分出三池额度上限。
-    ///
-    /// # Panics
-    /// 当比例之和不为 1 时 panic——划拨比例必须恰好分配全部资金，否则属配置错误。
+    /// 按比例切分总资金。比例之和不为 1 则 panic。
     pub fn new(total_capital: Money, ratios: PoolRatios) -> Self {
         assert_eq!(
             ratios.sum(),
@@ -69,33 +59,39 @@ impl CapitalPools {
         );
         Self {
             total_capital,
+            ratios,
             reserve: total_capital * ratios.reserve,
             grid_maker: total_capital * ratios.grid_maker,
             hedge_attack: total_capital * ratios.hedge_attack,
         }
     }
 
-    /// 以默认比例（25% / 52.5% / 22.5%）切分。
+    /// 用默认比例切分。
     pub fn with_default_ratios(total_capital: Money) -> Self {
         Self::new(total_capital, PoolRatios::default())
     }
 
-    /// 总资金 V。
+    /// 总资金。
     pub fn total_capital(&self) -> Money {
         self.total_capital
     }
 
-    /// 备用金池额度上限。
+    /// 比例配置。
+    pub fn ratios(&self) -> &PoolRatios {
+        &self.ratios
+    }
+
+    /// 备用金池额度。
     pub fn reserve(&self) -> Money {
         self.reserve
     }
 
-    /// 核心做市池额度上限。
+    /// 做市池额度。
     pub fn grid_maker(&self) -> Money {
         self.grid_maker
     }
 
-    /// 动量对冲池额度上限。
+    /// 对冲池额度。
     pub fn hedge_attack(&self) -> Money {
         self.hedge_attack
     }

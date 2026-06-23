@@ -1,10 +1,8 @@
-//! 模拟撮合后端：实现 [`ExchangeBackend`] 的内存"假交易所"，供策略与事件循环测试。
+//! 模拟撮合后端：内存里的"假交易所"，实现 [`ExchangeBackend`]，用于测试和回测。
 //!
-//! 支持两类成交：
-//! - **Maker 限价买单**：进入挂单簿，由行情驱动撮合——卖一价严格穿越挂单限价
-//!   （`best_ask < limit`）才成交，保守口径缓解逆向选择。
-//! - **Taker 即时买单**：提交瞬间以最近行情的卖一价立即成交，不进挂单簿；
-//!   卖一价缺失或高于限价上限则拒单。
+//! 两种成交方式：
+//! - Maker 限价买单：进挂单簿，行情驱动撮合。卖一价严格低于限价才成交（保守口径，减少逆向选择）。
+//! - Taker 即时买单：提交即以最新卖一价成交，不进挂单簿；无行情或价格超限则拒单。
 //!
 //! 手续费体现为净入仓股数的扣减（见 `domain::fee::FeeModel`）。
 
@@ -19,20 +17,20 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 /// 模拟撮合后端。
 ///
-/// 通过 [`Simulator::new`] 构造时返回事件接收端，调用方据此消费 [`ExchangeEvent`]。
+/// 构造时返回事件接收端，调用方从中消费 [`ExchangeEvent`]。
 pub struct Simulator {
-    /// 当前活跃挂单簿，按订单标识索引。
+    /// 活跃挂单簿，按订单 ID 索引。
     resting_orders: HashMap<OrderId, Order>,
-    /// 手续费模型，用于将名义成交股数换算为净入仓股数。
+    /// 手续费模型，把名义股数算成净入仓股数。
     fee_model: FeeModel,
-    /// 最近一次行情快照，供 Taker 即时成交读取卖一价；初始无行情时为 `None`。
+    /// 最近行情快照，Taker 成交时读卖一价用；初始无行情为 `None`。
     last_snapshot: Option<MarketSnapshot>,
     /// 事件回报发送端。
     event_sender: UnboundedSender<ExchangeEvent>,
 }
 
 impl Simulator {
-    /// 创建模拟后端，返回后端实例与事件接收端。
+    /// 创建模拟后端，返回实例和事件接收端。
     pub fn new(fee_model: FeeModel) -> (Self, UnboundedReceiver<ExchangeEvent>) {
         let (event_sender, event_receiver) = mpsc::unbounded_channel();
         let simulator = Self {
@@ -44,15 +42,14 @@ impl Simulator {
         (simulator, event_receiver)
     }
 
-    /// 当前活跃挂单数量。
+    /// 活跃挂单数量。
     pub fn resting_order_count(&self) -> usize {
         self.resting_orders.len()
     }
 
-    /// 喂入一笔最新市场快照，驱动撮合。
+    /// 喂入最新行情快照，驱动撮合。
     ///
-    /// 先刷新最近行情快照（供后续 Taker 即时成交读取），再遍历活跃挂单，
-    /// 对满足保守成交条件的买单产出 [`ExchangeEvent::Filled`] 并将其移出挂单簿。
+    /// 先更新行情（后续 Taker 要用），再遍历挂单，满足条件的成交并移出挂单簿。
     pub fn on_market(&mut self, snapshot: &MarketSnapshot) {
         self.last_snapshot = Some(*snapshot);
         let filled_ids: Vec<OrderId> = self
@@ -62,11 +59,12 @@ impl Simulator {
             .map(|order| order.order_id)
             .collect();
 
+        // TODO 有 resting_orders 了为何还要有 pending 订单？
         for order_id in filled_ids {
             let order = self.resting_orders.remove(&order_id).expect("挂单必存在");
-            // Maker 挂单以其限价成交（保守口径下卖一已穿越限价）。
+            // Maker 挂单以限价成交（保守口径下卖一已穿越限价）。
             let fill = self.build_fill(&order, order.price);
-            // 接收端已关闭时忽略发送错误：模拟后端不因下游停止消费而 panic。
+            // 接收端关了就忽略，模拟后端不因下游停止而 panic。
             let _ = self.event_sender.send(ExchangeEvent::Filled(fill));
         }
     }
@@ -151,16 +149,14 @@ impl ExchangeBackend for Simulator {
             .map(|order| order.order_id)
             .collect();
         for order_id in ids {
-            self.resting_orders.remove(&order_id);
-            let _ = self.event_sender.send(ExchangeEvent::Canceled(order_id));
+            self.cancel_order(order_id);
         }
     }
 
     fn cancel_all(&mut self) {
         let ids: Vec<OrderId> = self.resting_orders.keys().copied().collect();
         for order_id in ids {
-            self.resting_orders.remove(&order_id);
-            let _ = self.event_sender.send(ExchangeEvent::Canceled(order_id));
+            self.cancel_order(order_id);
         }
     }
 }

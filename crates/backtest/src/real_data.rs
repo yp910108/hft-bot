@@ -11,6 +11,7 @@ use crate::market::Market;
 use domain::market::{BookTop, MarketSnapshot};
 use domain::types::{Price, Side};
 use rust_decimal::Decimal;
+use std::fs;
 use std::path::Path;
 use std::str::FromStr;
 
@@ -71,7 +72,7 @@ fn parse_price(field: &str) -> Option<Price> {
 
 /// 加载单个 CSV 文件为一场回测市场数据。
 pub fn load_market<P: AsRef<Path>>(path: P) -> Result<Market, LoadError> {
-    let content = std::fs::read_to_string(path)?;
+    let content = fs::read_to_string(path)?;
     let mut lines = content.lines();
 
     let header = lines
@@ -123,7 +124,7 @@ pub fn load_market<P: AsRef<Path>>(path: P) -> Result<Market, LoadError> {
 
 /// 加载指定目录下的所有 CSV 文件为市场数据列表。
 pub fn load_dir<P: AsRef<Path>>(dir: P) -> Result<Vec<Market>, LoadError> {
-    let mut entries: Vec<_> = std::fs::read_dir(&dir)?
+    let mut entries: Vec<_> = fs::read_dir(&dir)?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|ext| ext == "csv"))
@@ -141,11 +142,14 @@ pub fn load_dir<P: AsRef<Path>>(dir: P) -> Result<Vec<Market>, LoadError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
+    use std::fs;
     use std::io::Write;
+    use std::path::PathBuf;
 
-    fn write_csv(tag: &str, content: &str) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!("hft_real_test_{tag}.csv"));
-        let mut f = std::fs::File::create(&path).unwrap();
+    fn write_csv(tag: &str, content: &str) -> PathBuf {
+        let path = env::temp_dir().join(format!("hft_real_test_{tag}.csv"));
+        let mut f = fs::File::create(&path).unwrap();
         f.write_all(content.as_bytes()).unwrap();
         path
     }
@@ -161,7 +165,7 @@ elapsed_secs,pm_price,ptb,up_bid,up_ask,down_bid,down_ask,up_bid_size,down_bid_s
         let market = load_market(&path).unwrap();
         assert_eq!(market.snapshots.len(), 2);
         assert_eq!(market.winner, Side::Up);
-        std::fs::remove_file(&path).ok();
+        fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -173,7 +177,7 @@ elapsed_secs,pm_price,ptb,up_bid,up_ask,down_bid,down_ask,up_bid_size,down_bid_s
         let path = write_csv("down_win", csv);
         let market = load_market(&path).unwrap();
         assert_eq!(market.winner, Side::Down);
-        std::fs::remove_file(&path).ok();
+        fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -199,6 +203,6 @@ elapsed_secs,pm_price,ptb,up_bid,up_ask,down_bid,down_ask,up_bid_size,down_bid_s
 ";
         let path = write_csv("no_ptb", csv);
         assert!(matches!(load_market(&path), Err(LoadError::Malformed(_))));
-        std::fs::remove_file(&path).ok();
+        fs::remove_file(&path).ok();
     }
 }

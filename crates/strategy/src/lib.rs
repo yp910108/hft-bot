@@ -1,15 +1,12 @@
-//! 梯度接低模块：初始布阵 + 跨侧配对重算（Gradient Low-Catching）。
+//! 梯度接低策略：在便宜的一侧分层挂买单，成交后自动在对面挂配对单锁利润。
 //!
-//! 对应策略说明书第四节。两个核心动作：
-//! 1. **初始布阵**（[`GradientLadder::deploy`]）：选 `best_ask < 0.5` 的一侧为主战场，
-//!    向下三层非饱和铺 Maker 买单。
-//! 2. **跨侧配对重算**（[`GradientLadder::recompute_after_fill`]）：每当本边 Maker 买单成交，
-//!    在成交价下方续挂追低，并撤销对面活跃单、按本边最新均价重算对面配对买入价，
-//!    确保 `本边均价 + 对面挂价 ≤ 1 - 最小利润空间`。配对价低于当前 Ask 直接挂 Maker，
-//!    否则转为 [`PendingOrder`] 挂起，等 Ask 跌到该价下方再补挂。
+//! 两件事：
+//! 1. **布阵**（[`GradientLadder::deploy`]）：挑 best_ask < 0.5 的一侧，向下铺三档 Maker 买单。
+//! 2. **配对重算**（[`GradientLadder::recompute_after_fill`]）：本边买单成交后，
+//!    在更低价续挂追低，同时撤对面旧单、按新均价算出对面配对价重新挂。
+//!    配对价低于对面 Ask 就直接挂，否则先挂起（[`PendingOrder`]），等价格跌下来再补。
 //!
-//! 本模块为纯逻辑：输入行情与持仓，产出一组 [`Command`]，不直接触碰交易所
-//! （见架构决策：策略产出指令列表）。
+//! 纯逻辑模块：吃行情和持仓，吐 [`Command`] 列表，不碰交易所。
 
 use domain::market::MarketSnapshot;
 use domain::order::{
@@ -19,33 +16,33 @@ use domain::types::{Money, OrderRole, Price, Qty, Side};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
-/// 单层梯度的布阵参数。
+/// 一档梯度的参数：挂多低、用多少钱。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LadderRung {
-    /// 相对该侧 best_ask 的向下价格偏移（正数，挂单价 = best_ask - offset）。
+    /// 挂单价 = best_ask - 这个偏移量。
     pub price_offset: Decimal,
-    /// 动用核心做市池的比例（如 0.02 表示 2%）。
+    /// 用核心做市池的多少比例（0.02 = 2%）。
     pub pool_fraction: Decimal,
 }
 
-/// 梯度接低的初始布阵配置：三层梯度 + 主战场判定阈值 + 跨侧重算参数。
+/// 布阵配置：三档梯度 + 主战场判定 + 配对重算参数。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LadderConfig {
-    /// 三层梯度，从首档到末档。
+    /// 三档梯度，从浅到深。
     pub rungs: [LadderRung; 3],
-    /// 主战场选择阈值：仅 best_ask 低于此值的一侧才可作为做市主战场。
+    /// 只有 best_ask 低于这个值的一侧才能当主战场。
     pub main_field_max_ask: Price,
-    /// 最小利润空间：对面配对价 = 1 - 本边均价 - 此值，确保双边均价之和留出利润。
+    /// 对面配对价 = 1 - 本边均价 - 这个值。留出利润空间。
     pub min_profit_margin: Decimal,
-    /// 本边续挂追低的价格步长：成交价下方该距离处再挂一档继续追低。
+    /// 成交后在更低价续挂的价格步长。
     pub follow_offset: Decimal,
-    /// 本边续挂追低动用核心做市池的比例。
+    /// 续挂用核心做市池的比例。
     pub follow_fraction: Decimal,
 }
 
 impl Default for LadderConfig {
-    /// 策略默认布阵：三层偏移 0.01/0.02/0.03，池占比 2%/3%/5%，主战场阈值 0.5，
-    /// 最小利润空间 0.02，续挂追低步长 0.01、占比 2%。
+    /// 默认值：三档偏移 0.01/0.02/0.03，池占比 2%/3%/5%，主战场阈值 0.5，
+    /// 利润空间 0.02，续挂步长 0.01、占比 2%。
     fn default() -> Self {
         Self {
             rungs: [
@@ -70,56 +67,63 @@ impl Default for LadderConfig {
     }
 }
 
-/// 一笔本边成交的上下文，作为跨侧配对重算的输入。
+/// 本边成交后的上下文，给配对重算用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FillContext {
-    /// 成交发生在哪一侧（本边）。
+    /// 成交发生在哪一侧。
     pub filled_side: Side,
-    /// 本笔成交价。
+    /// 成交价。
     pub filled_price: Price,
-    /// 本边成交后的最新持仓股数（作为对面摽齐的目标）。
+    /// 本边成交后的总持仓量。
     pub own_qty: Qty,
-    /// 对面当前持仓股数（用于算需补齐的差额）。
+    /// 对面当前持仓量。
     pub opposite_qty: Qty,
-    /// 本边成交后的最新加权均价。
+    /// 本边成交后的加权均价。
     pub own_average_price: Price,
-    /// 对面当前卖一价（Ask 审计用）；缺失时配对单只能挂起。
+    /// 对面当前卖一价；没有时配对单只能挂起。
     pub opposite_best_ask: Option<Price>,
 }
 
-/// 挂起的配对买单（Pending）：配对价 ≥ 当前 Ask 时暂不挂出，待 Ask 跌到该价下方再补挂。
-///
-/// 对应策略第四节「延迟补挂挂起机制」。
+/// 挂起的配对买单：配对价不低于对面 Ask，暂时挂不出去，等价格跌下来再补。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PendingOrder {
-    /// 挂起的目标侧。
+    /// 要挂到哪一侧。
     pub side: Side,
-    /// 目标配对买入价。
+    /// 目标配对价。
     pub price: Price,
-    /// 目标买入股数。
+    /// 目标买入量。
     pub qty: Qty,
 }
 
-/// 梯度接低初始布阵器。
+/// 配对重算的输出：立即下发的指令 + 可能挂起的配对单。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecomputeResult {
+    /// 立即执行的指令（续挂、撤对面、能直接挂的配对单）。
+    pub commands: Vec<Command>,
+    /// 配对价 >= 对面 Ask 时暂存在这里，等价格到位再补挂。
+    pub pending: Option<PendingOrder>,
+}
+
+/// 梯度接低策略的执行器。
 #[derive(Debug, Clone)]
 pub struct GradientLadder {
     config: LadderConfig,
 }
 
 impl GradientLadder {
-    /// 以指定配置创建布阵器。
+    /// 用指定配置创建。
     pub fn new(config: LadderConfig) -> Self {
         Self { config }
     }
 
-    /// 以策略默认配置创建布阵器。
+    /// 用默认配置创建。
     pub fn with_default_config() -> Self {
         Self::new(LadderConfig::default())
     }
 
-    /// 依据行情选出本轮做市主战场。
+    /// 选出本轮做市主战场。
     ///
-    /// 取双边中 `best_ask` 低于阈值且更小的一侧；两侧皆不满足时返回 `None`。
+    /// 取双边中 best_ask 低于阈值且更小的一侧；都不满足返回 None。
     pub fn select_main_field(&self, market: &MarketSnapshot) -> Option<Side> {
         let up_ask = market.book(Side::Up).best_ask;
         let down_ask = market.book(Side::Down).best_ask;
@@ -144,9 +148,7 @@ impl GradientLadder {
 
     /// 生成初始布阵的下单指令。
     ///
-    /// `grid_maker_pool` 为核心做市池额度上限；`id_generator` 为每层分配订单标识；
-    /// `generation` 为本批挂单的世代号；`constraints` 为交易所最小量约束。
-    /// 无主战场时返回空指令列表；某档不满足最小份数/金额约束时跳过该档（不上调，保持资金纪律）。
+    /// 无主战场时返回空列表；某档不够最小量约束就跳过（不上调，守资金纪律）。
     pub fn deploy(
         &self,
         market: &MarketSnapshot,
@@ -162,16 +164,15 @@ impl GradientLadder {
 
         let mut commands = Vec::with_capacity(self.config.rungs.len());
         for rung in &self.config.rungs {
-            // 价格按交易所精度向下量化（买单向下取整不抬高买价）。
+            // 买单价格向下取整，不抬高买价。
             let price = constraints.quantize_price(best_ask - rung.price_offset);
-            // 价格非正的档位无意义，跳过（极端薄盘下的保护）。
+            // 价格非正说明盘口极薄，跳过。
             if price <= Decimal::ZERO {
                 continue;
             }
-            // 股数先按精度向下量化，再以量化后的实际下单值校验最小量约束。
+            // 股数向下量化后校验最小量，不够就跳过（不上调，避免超支）。
             let qty =
                 constraints.quantize_qty(self.rung_qty(grid_maker_pool, rung.pool_fraction, price));
-            // 不满足交易所最小份数/金额约束的档位直接跳过（不上调，避免破坏池占比与超支）。
             if !constraints.is_satisfied(qty, price) {
                 continue;
             }
@@ -219,10 +220,14 @@ impl GradientLadder {
         let mut pending = None;
 
         // ① 本边续挂追低：成交价下方 follow_offset 再挂一档。
-        let follow_price = constraints.quantize_price(fill.filled_price - self.config.follow_offset);
+        let follow_price =
+            constraints.quantize_price(fill.filled_price - self.config.follow_offset);
         if follow_price > Decimal::ZERO {
-            let follow_qty = constraints
-                .quantize_qty(self.rung_qty(grid_maker_pool, self.config.follow_fraction, follow_price));
+            let follow_qty = constraints.quantize_qty(self.rung_qty(
+                grid_maker_pool,
+                self.config.follow_fraction,
+                follow_price,
+            ));
             if constraints.is_satisfied(follow_qty, follow_price) {
                 commands.push(Command::SubmitOrder(Order {
                     order_id: id_generator.next(),
@@ -302,7 +307,7 @@ impl GradientLadder {
         if matches!(cap, Some(gap) if gap <= Decimal::ZERO) {
             return Vec::new();
         }
-        // Taker 以对面卖一价吃单；卖一缺失则无从成交。
+        // Taker 以卖一价吃单；卖一缺失则无从成交。
         let Some(best_ask) = market.book(side).best_ask else {
             return Vec::new();
         };
@@ -331,15 +336,6 @@ impl GradientLadder {
             generation,
         })]
     }
-}
-
-/// 跨侧重算的产出：应立即下发的指令 + 可能挂起的配对单。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RecomputeResult {
-    /// 应立即下发给执行后端的指令（本边续挂、撤对面、可直接挂的配对单）。
-    pub commands: Vec<Command>,
-    /// 配对价 ≥ 对面 Ask 时挂起的配对单（等 Ask 跌到价下方再补挂）；无则为 `None`。
-    pub pending: Option<PendingOrder>,
 }
 
 #[cfg(test)]
@@ -404,9 +400,18 @@ mod tests {
         // 保留完整算式以体现推导链（如 1 层 = 1000 × 2% / 0.39 = 51.282… → 量化 51.28）。
         let constraints = OrderConstraints::default();
         let expected = [
-            (dec!(0.39), constraints.quantize_qty(dec!(1000) * dec!(0.02) / dec!(0.39))), // 1 层：ask-0.01，2%
-            (dec!(0.38), constraints.quantize_qty(dec!(1000) * dec!(0.03) / dec!(0.38))), // 2 层：ask-0.02，3%
-            (dec!(0.37), constraints.quantize_qty(dec!(1000) * dec!(0.05) / dec!(0.37))), // 3 层：ask-0.03，5%
+            (
+                dec!(0.39),
+                constraints.quantize_qty(dec!(1000) * dec!(0.02) / dec!(0.39)),
+            ), // 1 层：ask-0.01，2%
+            (
+                dec!(0.38),
+                constraints.quantize_qty(dec!(1000) * dec!(0.03) / dec!(0.38)),
+            ), // 2 层：ask-0.02，3%
+            (
+                dec!(0.37),
+                constraints.quantize_qty(dec!(1000) * dec!(0.05) / dec!(0.37)),
+            ), // 3 层：ask-0.03，5%
         ];
         for (command, (exp_price, exp_qty)) in commands.iter().zip(expected) {
             match command {
@@ -533,9 +538,7 @@ mod tests {
             Generation::new(),
         );
         // 应撤销对面 Down 侧全部活跃挂单。
-        assert!(result
-            .commands
-            .contains(&Command::CancelSide(Side::Down)));
+        assert!(result.commands.contains(&Command::CancelSide(Side::Down)));
     }
 
     #[test]

@@ -1,31 +1,26 @@
-//! 内存账本：维护双边持仓的股数、累计净成本与加权均价。
+//! 内存账本：记录 Up/Down 两侧各持有多少股、总共花了多少钱。
 //!
-//! 所有金额以 [`rust_decimal::Decimal`] 表示，保留精确值——均价为派生统计量，
-//! 盈亏与决策一律基于原始成本与股数计算，不做精度舍入。
-//!
-//! 设计原则：账本是系统唯一的持仓数据源，不维护「已实现利润」第二本账
-//! （与策略「不存在第二本账本」的口径一致）。卖出（清仓场景）按加权平均
-//! 成本法扣减成本，不在账本内沉淀已实现盈亏。
+//! 金额用 Decimal 精确表示，均价由股数和成本算出来，不做舍入。
+//! 账本只管"现在持有什么"，不记已实现盈亏——卖出时按加权均价扣成本就完事。
 
 use domain::order::{Fill, OrderDirection};
 use domain::pnl::PositionSnapshot;
 use domain::types::{Money, Price, Qty, Side};
 use rust_decimal::Decimal;
 
-/// 单侧持仓账本：记录某一侧的累计股数与累计净成本。
+/// 单侧账本：某一侧现在有多少股、总共花了多少钱。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct SideBook {
-    /// 当前持有股数。
+    /// 持有股数。
     qty: Qty,
-    /// 当前持仓的累计净成本（含已发生手续费）。
+    /// 买入这些股总共花的钱（含手续费）。
     cost: Money,
 }
 
 impl SideBook {
-    /// 加权均价 = 累计成本 / 持仓股数；无持仓时返回 0。
+    /// 加权均价 = 总成本 / 股数。没持仓时返回 0。
     ///
-    /// 返回**精确值**，不做精度舍入：均价是由 `cost`、`qty` 派生的统计量，
-    /// 盈亏与决策一律基于原始 `cost`、`qty` 计算，故此处保留精确值以免累积误差。
+    /// 保留精确值不舍入，因为盈亏计算都用原始 cost 和 qty，均价只是展示用的派生值。
     fn average_price(&self) -> Price {
         if self.qty.is_zero() {
             Decimal::ZERO
@@ -34,40 +29,38 @@ impl SideBook {
         }
     }
 
-    /// 买入：累加净入仓股数与花费现金。
+    /// 买入：加股数、加成本。
     ///
-    /// 手续费已在撮合层体现为股数扣减（见 `domain::fee::FeeModel`），故 `filled_qty`
-    /// 即净到手股数、`cash` 即实付现金，账本直接累加二者即可，无需再做费率换算。
+    /// 手续费已经在撮合层通过扣减股数来体现了，所以这里的 filled_qty 就是净到手股数，
+    /// cash 就是实付现金，直接累加即可。
     fn apply_buy(&mut self, filled_qty: Qty, cash: Money) {
         self.qty += filled_qty;
         self.cost += cash;
     }
 
-    /// 卖出：按加权平均成本法扣减。
+    /// 卖出：按加权均价扣减成本，剩余持仓的均价不变。
     ///
-    /// 扣减的成本 = 卖出股数 × 卖出前加权均价，使剩余持仓的均价保持不变。
-    /// 卖出手续费归属于已实现盈亏，由资金层处理，**不计入留存持仓的成本基础**，
-    /// 故本方法不接收手续费参数，避免抬高剩余持仓均价。
-    /// 卖出股数被限制在当前持仓量以内，避免账本出现负持仓。
+    /// 卖出手续费属于已实现盈亏，由资金层处理，不计入留存持仓成本——
+    /// 否则会虚抬剩余持仓的均价。卖出股数超过持仓量时截断到持仓量，防止负持仓。
     fn apply_sell(&mut self, qty: Qty) {
         let sell_qty = qty.min(self.qty);
         if sell_qty.is_zero() {
             return;
         }
-        // 此处 self.qty 必然非零（否则 sell_qty 为零已提前返回），故均价取原始值即可。
+        // sell_qty 非零说明 self.qty 非零，可以安全算均价。
         let avg_before = self.average_price();
         self.qty -= sell_qty;
-        // 仅扣减卖出份额对应的持仓成本，剩余持仓均价保持不变。
+        // 只扣掉卖出部分对应的成本，剩余持仓均价自然不变。
         self.cost -= avg_before * sell_qty;
-        // 全部卖出后该侧已无持仓：残留 cost 仅来自均价除法的舍入误差，
-        // 归零以免污染下一轮重新建仓时的均价计算。
+        // 全卖完了：把可能因除法产生的零头残留清零，
+        // 免得下次重新建仓时均价被污染。
         if self.qty.is_zero() {
             self.cost = Decimal::ZERO;
         }
     }
 }
 
-/// 双边账本：聚合 Up / Down 两侧持仓，并产出供盈亏计算的快照。
+/// 双边账本：汇总 Up/Down 两侧持仓，提供快照给盈亏计算用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Ledger {
     up: SideBook,
@@ -75,12 +68,12 @@ pub struct Ledger {
 }
 
 impl Ledger {
-    /// 创建一个空账本。
+    /// 创建空账本。
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// 将一笔成交回报应用到账本。
+    /// 把一笔成交写入账本。
     pub fn apply_fill(&mut self, fill: &Fill) {
         let book = match fill.side {
             Side::Up => &mut self.up,
@@ -92,7 +85,7 @@ impl Ledger {
         }
     }
 
-    /// 指定侧的当前持仓股数。
+    /// 查某一侧现在持有多少股。
     pub fn qty(&self, side: Side) -> Qty {
         match side {
             Side::Up => self.up.qty,
@@ -100,7 +93,7 @@ impl Ledger {
         }
     }
 
-    /// 指定侧的加权均价（精确值，不做精度舍入），无持仓时为 0。
+    /// 查某一侧的加权均价，没持仓时为 0。
     pub fn average_price(&self, side: Side) -> Price {
         match side {
             Side::Up => self.up.average_price(),

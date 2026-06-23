@@ -1,55 +1,60 @@
-//! 事件循环层：单写者主循环，把账本、状态机、策略、风控、执行后端串成闭环。
+//! Engine：整个机器人的"大脑"，把所有模块串起来的事件循环。
 //!
-//! 暴露 [`Engine::handle_event`]（喂一个交易所事件、返回应下发的指令）
-//! 与 [`Engine::start`]（初始布阵），由上层负责对接事件流与执行后端。
-//! 核心逻辑纯同步，天然满足单写者串行。
+//! 工作方式很简单：
+//! 1. 外部喂进一个事件（行情更新 / 成交回报）
+//! 2. Engine 内部更新账本、驱动状态机、决定该干什么
+//! 3. 返回一组指令（下单 / 撤单），由外部发给交易所
 //!
-//! 竞态隔离：每批新挂单世代号自增；低于当前世代的成交回报入账但不触发重算。
+//! 入口是 [`Engine::handle_event`] 和 [`Engine::start`]。
+//! 所有逻辑纯同步、单线程，不存在并发竞态。
 
 use domain::market::MarketSnapshot;
-use domain::order::{Command, Generation, Order, OrderConstraints, OrderDirection, OrderIdGenerator};
+use domain::order::{
+    Command, Fill, Generation, Order, OrderConstraints, OrderDirection, OrderIdGenerator,
+};
 use domain::state::RobotState;
 use domain::types::{Money, OrderRole, Side};
 use exchange::event::ExchangeEvent;
-use fsm::{StateMachine, StepInputs, Thresholds};
+use fsm::{StateMachine, StepInputs, Thresholds, Transition};
 use ledger::Ledger;
 use risk::auditor::RiskAuditor;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
+use std::mem;
 use strategy::{FillContext, GradientLadder, PendingOrder};
 
-/// 事件循环的运行参数。
+/// Engine 的配置参数。
 #[derive(Debug, Clone, Copy)]
 pub struct EngineConfig {
-    /// 核心做市池额度上限，供梯度布阵分配。
+    /// 做市池额度，梯度布阵从这里出钱。
     pub grid_maker_pool: Money,
-    /// 动量对冲池额度上限，供对冲阶段 Taker 单分配。
+    /// 对冲池额度，Taker 追买从这里出钱。
     pub hedge_attack_pool: Money,
-    /// 对冲单步预算比例：单步 Taker 预算 = 动量对冲池 × 此比例。
+    /// 每步 Taker 花对冲池多少比例（0.2 = 每步花 20%）。
     pub hedge_step_fraction: Decimal,
-    /// 对冲阶段 Taker 步数硬上限（每个对冲阶段独立计数，达上限停手扛到交割）。
+    /// 每个对冲阶段最多打几步 Taker，打完停手等交割。
     pub max_taker_steps: u32,
-    /// 交易所最小量与精度约束。
+    /// 交易所的最小下单量和精度。
     pub constraints: OrderConstraints,
 }
 
-/// 对冲阶段类别：用于「刚进入 / 切换对冲阶段」的边沿检测与 Taker 步数重置。
+/// 对冲阶段的粗分类。
 ///
-/// 不直接用状态机的 [`RobotState`]，是因为 `DynamicHedging` 的双负计数自增也会
-/// 改变状态变体（被 `is_moved` 误判为「刚进入」），故归并为粗粒度的阶段类别：
-/// `None`（非对冲）/ `Dynamic` / `Ev`，只在类别真正变化时才视为边沿。
+/// 为什么不直接用 RobotState？因为 DynamicHedging 内部的 double_negative_count 自增
+/// 也会让状态变体变化，但那不算"切换了对冲阶段"。这里只关心三种情况：
+/// 没在对冲 / 在动态对冲 / 在 EV 对冲。只有这三种之间切换时才重置 Taker 步数。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HedgePhase {
-    /// 非对冲阶段。
+    /// 不在对冲（常规做市、初始化、已收手等）。
     None,
-    /// 动态对冲阶段（追买瘸腿侧摽齐）。
+    /// 动态对冲：追买亏损侧，补到跟对面持仓一样多。
     Dynamic,
-    /// EV 对冲阶段（增厚优势方逼正 EV）。
+    /// EV 对冲：追买胜率高的一侧，把数学期望逼到非负。
     Ev,
 }
 
 impl HedgePhase {
-    /// 由状态机状态归类到对冲阶段类别。
+    /// 把状态机状态映射到对冲阶段分类。
     fn of(state: RobotState) -> Self {
         match state {
             RobotState::DynamicHedging { .. } => HedgePhase::Dynamic,
@@ -58,42 +63,44 @@ impl HedgePhase {
         }
     }
 
-    /// 是否属于对冲阶段（Dynamic 或 Ev）。
+    /// 当前是否在对冲中（Dynamic 或 Ev）。
     fn is_hedging(self) -> bool {
         matches!(self, HedgePhase::Dynamic | HedgePhase::Ev)
     }
 }
 
-/// 单写者事件循环。
+/// 机器人的事件循环主体。
+///
+/// 外部每收到一个交易所事件（行情/成交/撤单），就调 `handle_event` 喂进来，
+/// 它返回一组指令（下单/撤单）由外部发出去。内部维护账本、状态机、风控等全部状态。
 pub struct Engine {
     ledger: Ledger,
     state_machine: StateMachine,
     ladder: GradientLadder,
     auditor: RiskAuditor,
     id_generator: OrderIdGenerator,
-    /// 当前挂单世代号，每发起一批新挂单自增一次。
+    /// 世代号：每发一批新挂单自增。用来区分"这笔成交属于哪批挂单"。
     current_generation: Generation,
-    /// 当前可用现金，初始为总资金，随成交扣减。
+    /// 剩余可用现金（初始=总资金，每成交一笔就扣一笔）。
     free_cash: Money,
-    /// 最新市场快照，由 BookUpdate 事件刷新。
+    /// 最新的市场盘口快照。
     market: MarketSnapshot,
-    /// 本轮做市主战场侧（初始布阵时确定）：仅该侧的主动接低成交才触发跨侧重算，
-    /// 对面侧的配对买入成交不触发，以断开「配对又触发配对」的仓位滚雪球。
+    /// 本场做市的主战场是哪一侧（Up 或 Down）。
+    /// 只有主战场侧的成交才触发跨侧配对重算，对面的配对成交不触发（防滚雪球）。
     main_field: Option<Side>,
-    /// 挂起的配对买单：配对价 ≥ 对面 Ask 时暂存，待 Ask 跌到价下方再补挂。
+    /// 暂时挂不出去的配对单（配对价 ≥ 对面 Ask，等 Ask 跌下来再补挂）。
     pending_orders: Vec<PendingOrder>,
-    /// 当前所处对冲阶段类别，用于边沿检测（进入 / 切换阶段时重置 Taker 计数）。
+    /// 当前对冲阶段分类，用来检测"刚进入对冲"从而重置步数。
     hedge_phase: HedgePhase,
-    /// 当前对冲阶段已发出的 Taker 步数，进入 / 切换阶段时归零，达上限后停发。
+    /// 本对冲阶段已发了几步 Taker，达上限就停。
     taker_steps: u32,
-    /// 是否已收手：进入 FinalSettlement（利润锁定）后置位，此后停止一切新开仓，
-    /// 已持仓扛到交割兑现，避免继续滚仓位被反向大单吃掉利润。
+    /// 是否已收手（利润锁定后置 true，之后不再开新仓）。
     settled: bool,
     config: EngineConfig,
 }
 
 impl Engine {
-    /// 创建事件循环。`total_capital` 为账户总资金 V，初始即全部可用。
+    /// 创建 Engine。`total_capital` = 账户总资金，初始全部可用。
     pub fn new(
         total_capital: Money,
         thresholds: Thresholds,
@@ -134,16 +141,14 @@ impl Engine {
         self.free_cash
     }
 
-    /// 启动：完成初始化跳转并产出初始布阵指令。
-    ///
-    /// 需要先有行情（通过 [`Engine::handle_event`] 收到 `BookUpdate`）才能选主战场布阵；
-    /// 无行情时返回空指令。
+    /// 启动：状态机跳出初始化，铺好第一批梯度挂单。
+    /// 调用前需先喂一次行情（BookUpdate），否则选不出主战场，返回空。
     pub fn start(&mut self) -> Vec<Command> {
         self.state_machine.finish_initialization();
         self.deploy_ladder()
     }
 
-    /// 处理一个交易所事件，返回应下发的指令。
+    /// 喂入一个交易所事件，返回该发给交易所的指令。
     pub fn handle_event(&mut self, event: ExchangeEvent) -> Vec<Command> {
         match event {
             ExchangeEvent::BookUpdate(snapshot) => {
@@ -153,8 +158,9 @@ impl Engine {
                 if let Some(settle) = self.enter_settlement_if_locked() {
                     return settle;
                 }
-                // 已收手则不再补挂；对冲阶段不在行情驱动下主动发 Taker（推进一律由成交驱动，
-                // 避免一个 tick 内连环发单打穿步数上限）；常规阶段检查挂起的配对单。
+                // 已收手 → 啥也不干。
+                // 对冲阶段 → 不在行情 tick 里主动发 Taker（防止一个 tick 连环打光步数）。
+                // 常规阶段 → 看看之前挂起的配对单能不能补上。
                 if self.settled || self.hedge_phase.is_hedging() {
                     Vec::new()
                 } else {
@@ -162,8 +168,7 @@ impl Engine {
                 }
             }
             ExchangeEvent::Filled(fill) => {
-                // 成交是不可撤销的事实：无论属于哪个世代，一律入账并扣减现金，
-                // 否则账本会与交易所真实持仓不一致（撤单只对未成交挂单生效，对已成交无效）。
+                // 无论新旧世代，成交是既成事实，必须入账（否则账本和交易所不一致）。
                 let is_current = fill.generation >= self.current_generation;
                 self.ledger.apply_fill(&fill);
                 self.free_cash -= fill.cash;
@@ -175,12 +180,13 @@ impl Engine {
                 if self.settled {
                     return Vec::new();
                 }
-                // 对冲阶段：每笔成交评估是否再推进一步 Taker（步步串行：发单→即时成交→再评估）。
+                // 对冲阶段：每笔成交后评估要不要再打一步 Taker。
                 if self.hedge_phase.is_hedging() {
                     return self.hedge_step();
                 }
-                // 常规阶段：仅对「当前世代 + 主战场侧（主动接低）」的买入成交触发跨侧重算；
-                // 对面配对成交不触发，断开正反馈滚雪球；旧世代成交亦不触发。
+                // TODO 为什么只对"本世代 + 主战场侧"的买入成交触发跨侧配对重算？
+                // 常规阶段：只对"本世代 + 主战场侧"的买入成交触发跨侧配对重算。
+                // 对面配对成交不触发（防滚雪球），旧世代成交也不触发。
                 let is_main_field = self.main_field == Some(fill.side);
                 if is_current && is_main_field && fill.direction == OrderDirection::Buy {
                     self.recompute_after_fill(&fill)
@@ -188,15 +194,12 @@ impl Engine {
                     Vec::new()
                 }
             }
-            // 拒单与撤单确认暂不触发新指令。
+            // 拒单和撤单确认目前不需要做什么。
             ExchangeEvent::Rejected { .. } | ExchangeEvent::Canceled(_) => Vec::new(),
         }
     }
 
-    /// 同步对冲阶段类别：阶段类别发生变化（进入或在 Dynamic/Ev 间切换）时，重置 Taker 步数。
-    ///
-    /// 用粗粒度的 [`HedgePhase`] 而非 [`RobotState`] 做边沿检测，避免 `DynamicHedging`
-    /// 的双负计数自增被误判为「刚进入对冲」而错误重置 / 重复发单。
+    /// 检测对冲阶段是否切换了（None↔Dynamic↔Ev），切换时重置 Taker 步数。
     fn sync_hedge_phase(&mut self) {
         let phase = HedgePhase::of(self.state_machine.state());
         if phase != self.hedge_phase {
@@ -205,10 +208,8 @@ impl Engine {
         }
     }
 
-    /// 利润锁定即停手闸：状态机首次进入 [`RobotState::FinalSettlement`] 时一次性收手——
-    /// 撤销全部活跃挂单、清空待补挂队列、置位 `settled`，此后停止一切新开仓。
-    ///
-    /// 返回 `Some(收手指令)` 表示本次刚进入收手；`None` 表示无需处理（未达成或早已收手）。
+    /// 利润锁定时一次性收手：撤全部挂单、清待补队列、标记 settled。
+    /// 返回 Some(撤单指令) 表示刚收手，None 表示没变化。
     fn enter_settlement_if_locked(&mut self) -> Option<Vec<Command>> {
         if self.settled {
             return None;
@@ -222,8 +223,8 @@ impl Engine {
         }
     }
 
-    /// 本边买入成交后触发跨侧配对重算：世代号自增、产出经风控的指令，并记录挂起的配对单。
-    fn recompute_after_fill(&mut self, fill: &domain::order::Fill) -> Vec<Command> {
+    /// 主战场侧成交后，重算对面的配对挂单。
+    fn recompute_after_fill(&mut self, fill: &Fill) -> Vec<Command> {
         self.current_generation = self.current_generation.next();
         let context = FillContext {
             filled_side: fill.side,
@@ -250,11 +251,11 @@ impl Engine {
             .collect()
     }
 
-    /// 检查挂起的配对单：对面 Ask 已跌到目标价下方的，转为正式 Maker 买单补挂。
+    /// 检查挂起的配对单：当对面 Ask 回升到目标价上方时，就把之前挂不出去的单正式挂上。
     fn try_post_pending(&mut self) -> Vec<Command> {
         let mut commands = Vec::new();
         let mut still_pending = Vec::new();
-        for pending in std::mem::take(&mut self.pending_orders) {
+        for pending in mem::take(&mut self.pending_orders) {
             let postable = matches!(
                 self.market.book(pending.side).best_ask,
                 Some(ask) if pending.price < ask
@@ -281,8 +282,8 @@ impl Engine {
         commands
     }
 
-    /// 依据当前账本与行情驱动状态机评估一次流转，返回流转结果。
-    fn drive_state_machine(&mut self) -> fsm::Transition {
+    /// 用当前账本和行情让状态机评估一次，看要不要跳转状态。
+    fn drive_state_machine(&mut self) -> Transition {
         let inputs = StepInputs {
             position: self.ledger.snapshot(),
             market: self.market,
@@ -290,16 +291,15 @@ impl Engine {
         self.state_machine.step(&inputs)
     }
 
-    /// 对冲单步推进：据当前对冲阶段决定追买侧与单步量上限，产出至多一条 Taker 指令。
-    ///
-    /// 达步数上限则停手（扛到交割）。实际产出经风控的 SubmitOrder 时，Taker 步数自增一次。
+    /// 对冲单步：决定追买哪侧、买多少，产出至多一条 Taker 指令。
+    /// 达到步数上限就停（扛到交割）。只有真的发出了指令才计步（被风控拦截不算）。
     fn hedge_step(&mut self) -> Vec<Command> {
         if self.taker_steps >= self.config.max_taker_steps {
             return Vec::new();
         }
-        // 据阶段确定追买侧与单步量上限（cap）。
+        // 确定追买哪侧、量的上限。
         let (side, cap) = match self.hedge_phase {
-            // 动态对冲：追买瘸腿侧，补到与对面摽齐（cap = 摽齐缺口）。
+            // 动态对冲：追买亏损侧，补到跟对面一样多（cap = 差额）。
             HedgePhase::Dynamic => match self.lame_side() {
                 Some(side) => {
                     let gap = self.ledger.qty(side.opposite()) - self.ledger.qty(side);
@@ -307,7 +307,7 @@ impl Engine {
                 }
                 None => return Vec::new(),
             },
-            // EV 对冲：追买优势方增厚筹码（cap = None，纯预算封顶）。
+            // EV 对冲：追买胜率高的那侧（cap = None，纯靠预算封顶）。
             HedgePhase::Ev => match self.advantaged_side() {
                 Some(side) => (side, None),
                 None => return Vec::new(),
@@ -333,21 +333,24 @@ impl Engine {
             .collect();
         // 仅在实际产出对冲指令时计步（扑空 / 被风控拦截不消耗步数）。
         if !commands.is_empty() {
+            // TODO 这里 taker_steps 在重置后重新计数？合理吗？
             self.taker_steps += 1;
         }
         commands
     }
 
-    /// 动态对冲的瘸腿侧：条件 PnL 穿透对冲亏损线的一侧；双侧同时穿透则取亏损更深的一侧。
+    /// 找出亏损侧（"瘸腿"）：哪边的条件 PnL 穿透了亏损线就追买哪边。
+    /// 两边都穿了就追更亏的那边。
     fn lame_side(&self) -> Option<Side> {
         let position = self.ledger.snapshot();
         let trigger = self.state_machine.thresholds().hedge_loss_trigger;
         let up_pnl = position.up_win_pnl();
         let down_pnl = position.down_win_pnl();
+        // TODO 这里缺少数量的判断？
+        // TODO 这里和 fsm 里的逻辑重复？
         let up_breached = up_pnl <= -trigger;
         let down_breached = down_pnl <= -trigger;
         match (up_breached, down_breached) {
-            // 双侧皆穿透：追买亏损更深（PnL 更小）的一侧。
             (true, true) => Some(if up_pnl <= down_pnl {
                 Side::Up
             } else {
@@ -359,24 +362,20 @@ impl Engine {
         }
     }
 
-    /// EV 对冲的优势方：以 Up 侧 Mark Price 近似 Up 胜出概率，> 0.5 则优势在 Up，否则 Down。
-    ///
-    /// Mark Price 缺失时无从判定优势方，返回 `None`（本步不发对冲单）。
+    /// 找优势方：Up 侧 Mark Price > 0.5 说明市场看好 Up，就追买 Up；否则追 Down。
+    /// 盘口缺失时返回 None（这步不打）。
     fn advantaged_side(&self) -> Option<Side> {
-        self.market
-            .mark_price(Side::Up)
-            .map(|up_probability| {
-                if up_probability > dec!(0.5) {
-                    Side::Up
-                } else {
-                    Side::Down
-                }
-            })
+        self.market.mark_price(Side::Up).map(|up_probability| {
+            if up_probability > dec!(0.5) {
+                Side::Up
+            } else {
+                Side::Down
+            }
+        })
     }
 
-    /// 发起一批梯度布阵：世代号自增，产出经风控通过的下单指令。
+    /// 铺梯度挂单：选主战场、世代号+1、生成挂单指令、过风控。
     fn deploy_ladder(&mut self) -> Vec<Command> {
-        // 记录本轮主战场侧：后续仅该侧的主动接低成交触发跨侧重算。
         self.main_field = self.ladder.select_main_field(&self.market);
         self.current_generation = self.current_generation.next();
         let commands = self.ladder.deploy(
@@ -386,14 +385,13 @@ impl Engine {
             &mut self.id_generator,
             self.current_generation,
         );
-        // 逐条过风控：Cash Guard 拒绝的指令不下发。
         commands
             .into_iter()
             .filter(|command| self.approve_command(command))
             .collect()
     }
 
-    /// 风控审计单条指令；非下单指令（撤单）默认放行。
+    /// 过风控：下单指令要过 Cash Guard 审计，撤单指令直接放行。
     fn approve_command(&self, command: &Command) -> bool {
         match command {
             Command::SubmitOrder(order) => {
@@ -640,12 +638,7 @@ mod tests {
     }
 
     /// 构造带完整买卖盘的双边市场快照（Mark Price 可由中间价计算）。
-    fn full_book(
-        up_bid: Money,
-        up_ask: Money,
-        down_bid: Money,
-        down_ask: Money,
-    ) -> ExchangeEvent {
+    fn full_book(up_bid: Money, up_ask: Money, down_bid: Money, down_ask: Money) -> ExchangeEvent {
         ExchangeEvent::BookUpdate(MarketSnapshot {
             up: BookTop {
                 best_bid: Some(up_bid),
@@ -667,6 +660,7 @@ mod tests {
         engine.handle_event(full_book(dec!(0.05), dec!(0.10), dec!(0.55), dec!(0.60)));
         engine.start();
         // 一笔 Down 重仓成交：down_qty=100、总成本 60 → up_win_pnl = 0 - 60 = -60 ≤ -30，
+        // TODO 这注释对吗？
         // 且 Up mark 0.075 < 0.5 → 触发动态对冲，追买瘸腿侧 Up。
         let commands = engine.handle_event(ExchangeEvent::Filled(Fill {
             order_id: OrderId(0),
@@ -677,10 +671,7 @@ mod tests {
             cash: dec!(60),
             generation: Generation(1),
         }));
-        assert!(matches!(
-            engine.state(),
-            RobotState::DynamicHedging { .. }
-        ));
+        assert!(matches!(engine.state(), RobotState::DynamicHedging { .. }));
         // 首发对冲：一条 Up 侧 Taker 买单，价取 Up 卖一 0.10，量 = 摽齐缺口 min(预算可买, gap=100)。
         // 预算 = 动量池 225 × 0.2 = 45 → 可买 450，受缺口 100 封顶 → 100 股。
         assert_eq!(commands.len(), 1);
@@ -712,7 +703,8 @@ mod tests {
         }));
         assert!(matches!(engine.state(), RobotState::DynamicHedging { .. }));
         // 对冲态下，行情更新绝不主动发 Taker（推进一律由成交驱动，避免一个 tick 连环失控）。
-        let on_book = engine.handle_event(full_book(dec!(0.05), dec!(0.11), dec!(0.55), dec!(0.60)));
+        let on_book =
+            engine.handle_event(full_book(dec!(0.05), dec!(0.11), dec!(0.55), dec!(0.60)));
         assert!(on_book.is_empty());
     }
 
