@@ -133,11 +133,16 @@ def _build_rows(ops):
             cuq += s; cuc += p * s
         else:
             cdq += s; cdc += p * s
-        tc = cuc + cdc
-        ua = cuc / cuq if cuq > 0 else 0
-        da = cdc / cdq if cdq > 0 else 0
-        pu = cuq - tc
-        pd = cdq - tc
+        # 如果 JSON 有 engine 算好的真实值就用，否则回退到自己累加的（兼容旧数据）。
+        up_qty = op.get("up_qty", cuq)
+        up_cost = op.get("up_cost", cuc)
+        dn_qty = op.get("dn_qty", cdq)
+        dn_cost = op.get("dn_cost", cdc)
+        tc = op.get("total_cost", cuc + cdc)
+        ua = up_cost / up_qty if up_qty > 0 else 0
+        da = dn_cost / dn_qty if dn_qty > 0 else 0
+        pu = op.get("pnl_if_up_wins", up_qty - tc)
+        pd = op.get("pnl_if_dn_wins", dn_qty - tc)
         ps = pu - pd
         act = classify_step(d, puq, puc, pdq, pdc, cuq, cuc, cdq, cdc)
         sw = prev_dir is not None and d != prev_dir
@@ -163,8 +168,8 @@ def _build_rows(ops):
         rows.append(f"<tr{row_style}><td>{j+1}</td><td>{t}</td><td>{dir_h}</td>"
                     f"<td>{role_h}</td>"
                     f"<td>{p:.4f}</td><td>{s:.1f}</td>"
-                    f"<td>{cuq:.1f}</td><td>{cuc:.2f}</td><td>{ua:.4f}</td>"
-                    f"<td>{cdq:.1f}</td><td>{cdc:.2f}</td><td>{da:.4f}</td>"
+                    f"<td>{up_qty:.1f}</td><td>{up_cost:.2f}</td><td>{ua:.4f}</td>"
+                    f"<td>{dn_qty:.1f}</td><td>{dn_cost:.2f}</td><td>{da:.4f}</td>"
                     f"<td>{tc:.2f}</td>"
                     f'<td style="color:{pnl_c(pu)}">{pu:+.2f}</td>'
                     f'<td style="color:{pnl_c(pd)}">{pd:+.2f}</td>'
