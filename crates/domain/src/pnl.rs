@@ -66,6 +66,21 @@ impl PositionSnapshot {
         up_win_probability * self.up_win_pnl() + q * self.down_win_pnl()
     }
 
+    /// 找 PnL 更小的一侧（瘸腿侧）。两侧相等返回 None。
+    ///
+    /// 用于 PnL 驱动的对冲决策：不看穿不穿线，只看哪边更弱就追买哪边。
+    pub fn weaker_side(&self) -> Option<Side> {
+        let up = self.up_win_pnl();
+        let down = self.down_win_pnl();
+        if up < down {
+            Some(Side::Up)
+        } else if down < up {
+            Some(Side::Down)
+        } else {
+            None
+        }
+    }
+
     /// 找出穿透亏损线的一侧（"瘸腿侧"）。
     ///
     /// 条件：总持仓 ≥ min_qty（防开局噪音）且某边 PnL ≤ -loss_trigger。
@@ -221,5 +236,38 @@ mod tests {
             total_cost: dec!(100),
         };
         assert_eq!(pos.breached_side(dec!(30), dec!(0)), Some(Side::Down));
+    }
+
+    #[test]
+    fn weaker_side_returns_up_when_up_pnl_smaller() {
+        // up_pnl = 20-80 = -60, down_pnl = 100-80 = 20。Up 更弱。
+        let pos = PositionSnapshot {
+            up_qty: dec!(20),
+            down_qty: dec!(100),
+            total_cost: dec!(80),
+        };
+        assert_eq!(pos.weaker_side(), Some(Side::Up));
+    }
+
+    #[test]
+    fn weaker_side_returns_down_when_down_pnl_smaller() {
+        // up_pnl = 100-80 = 20, down_pnl = 30-80 = -50。Down 更弱。
+        let pos = PositionSnapshot {
+            up_qty: dec!(100),
+            down_qty: dec!(30),
+            total_cost: dec!(80),
+        };
+        assert_eq!(pos.weaker_side(), Some(Side::Down));
+    }
+
+    #[test]
+    fn weaker_side_returns_none_when_equal() {
+        // up_pnl = 50-80 = -30, down_pnl = 50-80 = -30。相等。
+        let pos = PositionSnapshot {
+            up_qty: dec!(50),
+            down_qty: dec!(50),
+            total_cost: dec!(80),
+        };
+        assert_eq!(pos.weaker_side(), None);
     }
 }

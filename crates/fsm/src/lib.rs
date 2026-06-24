@@ -19,13 +19,16 @@ pub struct Thresholds {
     pub profit_target: Money,
 }
 
-/// 每次 step 需要的输入：当前持仓和盘口。
+/// 每次 step 需要的输入：当前持仓、盘口、对冲耗尽标记。
 #[derive(Debug, Clone, Copy)]
 pub struct StepInputs {
     /// 当前持仓，用来算盈亏。
     pub position: PositionSnapshot,
     /// 当前盘口，EV 对冲阶段用它估算胜出概率。
     pub market: MarketSnapshot,
+    /// 对冲步数已达上限且还有剩余预算（由 engine 计算填入）。
+    /// 为 true 时对冲阶段会回退到做市，让系统用剩余预算再来一轮。
+    pub hedge_exhausted: bool,
 }
 
 /// step 的返回值：告诉调用方状态有没有变。
@@ -77,6 +80,12 @@ impl StateMachine {
         self.thresholds
     }
 
+    /// 强制设置状态（仅供外部 crate 测试使用）。
+    #[doc(hidden)]
+    pub fn force_state(&mut self, state: RobotState) {
+        self.state = state;
+    }
+
     /// 喂入一次数据，判断要不要跳状态，跳了就更新自身。
     pub fn step(&mut self, inputs: &StepInputs) -> Transition {
         let next = self.next_state(inputs);
@@ -125,6 +134,9 @@ impl StateMachine {
             } => {
                 if self.profit_target_reached(&inputs.position) {
                     RobotState::FinalSettlement
+                } else if inputs.hedge_exhausted {
+                    // 对冲步数用完但还有预算，回到做市继续接低。
+                    RobotState::RangeBoundMaking
                 } else if inputs.position.both_sides_negative() {
                     if double_negative_count >= 1 {
                         RobotState::EvHedging
@@ -143,6 +155,9 @@ impl StateMachine {
             RobotState::EvHedging => {
                 if expected_value_non_negative(&inputs.position, &inputs.market) {
                     RobotState::FinalSettlement
+                } else if inputs.hedge_exhausted {
+                    // EV 对冲步数用完但还有预算，回到做市。
+                    RobotState::RangeBoundMaking
                 } else {
                     RobotState::EvHedging
                 }
@@ -233,6 +248,7 @@ mod tests {
         let inputs = StepInputs {
             position: position(dec!(100), dec!(100), dec!(50)),
             market: neutral_market(),
+            hedge_exhausted: false,
         };
         let transition = machine.step(&inputs);
         assert!(!transition.is_moved());
@@ -254,6 +270,7 @@ mod tests {
         let inputs = StepInputs {
             position: position(dec!(100), dec!(100), dec!(80)),
             market: neutral_market(),
+            hedge_exhausted: false,
         };
         let transition = machine.step(&inputs);
         assert_eq!(transition.state(), RobotState::FinalSettlement);
@@ -266,6 +283,7 @@ mod tests {
         let inputs = StepInputs {
             position: position(dec!(100), dec!(100), dec!(90)),
             market: neutral_market(),
+            hedge_exhausted: false,
         };
         let transition = machine.step(&inputs);
         assert_eq!(transition.state(), RobotState::RangeBoundMaking);
@@ -279,6 +297,7 @@ mod tests {
         let inputs = StepInputs {
             position: position(dec!(5), dec!(60), dec!(50)),
             market: neutral_market(),
+            hedge_exhausted: false,
         };
         let transition = machine.step(&inputs);
         assert_eq!(transition.state(), RobotState::RangeBoundMaking);
@@ -289,6 +308,7 @@ mod tests {
         let inputs2 = StepInputs {
             position: position(dec!(20), dec!(100), dec!(80)),
             market: neutral_market(),
+            hedge_exhausted: false,
         };
         let transition2 = machine.step(&inputs2);
         assert_eq!(
@@ -307,6 +327,7 @@ mod tests {
         let inputs = StepInputs {
             position: position(dec!(10), dec!(40), dec!(80)),
             market: neutral_market(),
+            hedge_exhausted: false,
         };
         let transition = machine.step(&inputs);
         assert_eq!(transition.state(), RobotState::RangeBoundMaking);
@@ -320,6 +341,7 @@ mod tests {
         machine.step(&StepInputs {
             position: position(dec!(20), dec!(100), dec!(80)),
             market: neutral_market(),
+            hedge_exhausted: false,
         });
         assert_eq!(
             machine.state(),
@@ -329,6 +351,7 @@ mod tests {
         let transition = machine.step(&StepInputs {
             position: position(dec!(40), dec!(50), dec!(100)),
             market: neutral_market(),
+            hedge_exhausted: false,
         });
         assert!(transition.is_moved());
         assert_eq!(
@@ -347,10 +370,12 @@ mod tests {
         machine.step(&StepInputs {
             position: position(dec!(20), dec!(100), dec!(80)),
             market: neutral_market(),
+            hedge_exhausted: false,
         });
         let double_negative = StepInputs {
             position: position(dec!(40), dec!(50), dec!(100)),
             market: neutral_market(),
+            hedge_exhausted: false,
         };
         machine.step(&double_negative);
         let transition = machine.step(&double_negative);
@@ -365,10 +390,12 @@ mod tests {
         machine.step(&StepInputs {
             position: position(dec!(20), dec!(100), dec!(80)),
             market: neutral_market(),
+            hedge_exhausted: false,
         });
         let transition = machine.step(&StepInputs {
             position: position(dec!(100), dec!(100), dec!(80)),
             market: neutral_market(),
+            hedge_exhausted: false,
         });
         assert_eq!(transition.state(), RobotState::FinalSettlement);
     }
@@ -381,10 +408,12 @@ mod tests {
         machine.step(&StepInputs {
             position: position(dec!(20), dec!(100), dec!(80)),
             market: neutral_market(),
+            hedge_exhausted: false,
         });
         let double_negative = StepInputs {
             position: position(dec!(40), dec!(50), dec!(100)),
             market: neutral_market(),
+            hedge_exhausted: false,
         };
         machine.step(&double_negative);
         machine.step(&double_negative);
@@ -393,6 +422,7 @@ mod tests {
         let transition = machine.step(&StepInputs {
             position: position(dec!(120), dec!(80), dec!(100)),
             market: market_with_up_mid(dec!(0.6)),
+            hedge_exhausted: false,
         });
         assert_eq!(transition.state(), RobotState::FinalSettlement);
     }
@@ -404,11 +434,13 @@ mod tests {
         machine.step(&StepInputs {
             position: position(dec!(100), dec!(100), dec!(80)),
             market: neutral_market(),
+            hedge_exhausted: false,
         });
         assert_eq!(machine.state(), RobotState::FinalSettlement);
         let transition = machine.step(&StepInputs {
             position: position(dec!(200), dec!(200), dec!(50)),
             market: neutral_market(),
+            hedge_exhausted: false,
         });
         assert!(!transition.is_moved());
     }
@@ -423,7 +455,87 @@ mod tests {
         let transition = machine.step(&StepInputs {
             position: position(dec!(50), dec!(100), dec!(180)),
             market: neutral_market(),
+            hedge_exhausted: false,
         });
         assert_eq!(transition.state(), RobotState::EvHedging);
+    }
+
+    #[test]
+    fn dynamic_hedging_returns_to_making_when_exhausted() {
+        let mut machine = StateMachine::new(thresholds());
+        machine.finish_initialization();
+        // 进入 DynamicHedging。
+        machine.step(&StepInputs {
+            position: position(dec!(20), dec!(100), dec!(80)),
+            market: neutral_market(),
+            hedge_exhausted: false,
+        });
+        assert!(matches!(machine.state(), RobotState::DynamicHedging { .. }));
+        // hedge_exhausted=true → 回退到 RangeBoundMaking。
+        let transition = machine.step(&StepInputs {
+            position: position(dec!(20), dec!(100), dec!(80)),
+            market: neutral_market(),
+            hedge_exhausted: true,
+        });
+        assert_eq!(transition.state(), RobotState::RangeBoundMaking);
+    }
+
+    #[test]
+    fn ev_hedging_returns_to_making_when_exhausted() {
+        let mut machine = StateMachine::new(thresholds());
+        machine.finish_initialization();
+        // 直接进 EvHedging（双边穿线 + both_sides_negative）。
+        machine.step(&StepInputs {
+            position: position(dec!(50), dec!(100), dec!(180)),
+            market: neutral_market(),
+            hedge_exhausted: false,
+        });
+        assert_eq!(machine.state(), RobotState::EvHedging);
+        // hedge_exhausted=true → 回退。
+        let transition = machine.step(&StepInputs {
+            position: position(dec!(50), dec!(100), dec!(180)),
+            market: neutral_market(),
+            hedge_exhausted: true,
+        });
+        assert_eq!(transition.state(), RobotState::RangeBoundMaking);
+    }
+
+    #[test]
+    fn exhausted_does_not_override_profit_lock() {
+        let mut machine = StateMachine::new(thresholds());
+        machine.finish_initialization();
+        // 进入 DynamicHedging。
+        machine.step(&StepInputs {
+            position: position(dec!(20), dec!(100), dec!(80)),
+            market: neutral_market(),
+            hedge_exhausted: false,
+        });
+        // 利润锁定优先级高于 exhausted → FinalSettlement 而非 RangeBoundMaking。
+        let transition = machine.step(&StepInputs {
+            position: position(dec!(100), dec!(100), dec!(80)),
+            market: neutral_market(),
+            hedge_exhausted: true,
+        });
+        assert_eq!(transition.state(), RobotState::FinalSettlement);
+    }
+
+    #[test]
+    fn not_exhausted_stays_in_hedging() {
+        let mut machine = StateMachine::new(thresholds());
+        machine.finish_initialization();
+        // 进入 DynamicHedging。
+        machine.step(&StepInputs {
+            position: position(dec!(20), dec!(100), dec!(80)),
+            market: neutral_market(),
+            hedge_exhausted: false,
+        });
+        // hedge_exhausted=false → 不回退，留在 DynamicHedging。
+        let transition = machine.step(&StepInputs {
+            position: position(dec!(20), dec!(100), dec!(80)),
+            market: neutral_market(),
+            hedge_exhausted: false,
+        });
+        assert!(!transition.is_moved());
+        assert!(matches!(machine.state(), RobotState::DynamicHedging { .. }));
     }
 }

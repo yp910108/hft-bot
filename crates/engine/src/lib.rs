@@ -129,20 +129,29 @@ impl Engine {
                 self.market = snapshot;
                 self.hedge_fired_this_tick = false;
                 self.drive_state_machine();
-                self.sync_hedge_phase();
+                let mut commands = self.sync_hedge_phase();
                 if let Some(settle) = self.enter_settlement_if_locked() {
                     return settle;
                 }
                 // 已收手 → 啥也不干。
                 // 对冲阶段 → 不在行情 tick 里主动发 Taker（防止一个 tick 连环打光步数）。
                 // 常规阶段 → 看看之前挂起的配对单能不能补上。
-                if self.settled || self.hedge_phase.is_hedging() {
+                if self.settled {
                     Vec::new()
+                } else if self.hedge_phase.is_hedging() {
+                    commands
+                } else if commands.contains(&Command::CancelAll) {
+                    // 刚从对冲回退到做市，立即重铺梯度。
+                    commands.extend(self.deploy_ladder());
+                    commands
                 } else {
-                    self.try_post_pending()
+                    commands.extend(self.try_post_pending());
+                    commands
                 }
             }
             ExchangeEvent::Filled(fill) => {
+                // 每笔成交都是新的决策点，允许发下一步对冲（不受同 tick 限流）。
+                self.hedge_fired_this_tick = false;
                 // 无论新旧世代，成交是既成事实，必须入账（否则账本和交易所不一致）。
                 let is_current = fill.generation >= self.current_generation;
                 let is_hedging = self.hedge_phase.is_hedging();
@@ -153,7 +162,7 @@ impl Engine {
                     self.hedge_budget_remaining -= fill.cash;
                 }
                 self.drive_state_machine();
-                self.sync_hedge_phase();
+                let mut phase_commands = self.sync_hedge_phase();
                 if let Some(settle) = self.enter_settlement_if_locked() {
                     return settle;
                 }
@@ -162,28 +171,38 @@ impl Engine {
                 }
                 // 对冲阶段：每笔成交后评估要不要再打一步 Taker。
                 if self.hedge_phase.is_hedging() {
-                    return self.hedge_step();
+                    phase_commands.extend(self.hedge_step());
+                    return phase_commands;
+                }
+                // 刚从对冲回退到做市（phase_commands 含 CancelAll），立即重铺梯度。
+                if phase_commands.contains(&Command::CancelAll) {
+                    phase_commands.extend(self.deploy_ladder());
+                    return phase_commands;
                 }
                 // 常规阶段：只对"本世代 + 主战场侧"的买入成交触发跨侧配对重算。
                 // 对面配对成交不触发（防滚雪球），旧世代成交也不触发。
                 let is_main_field = self.main_field == Some(fill.side);
                 if is_current && is_main_field && fill.direction == OrderDirection::Buy {
-                    self.recompute_after_fill(&fill)
-                } else {
-                    Vec::new()
+                    phase_commands.extend(self.recompute_after_fill(&fill));
                 }
+                phase_commands
             }
             // 拒单和撤单确认目前不需要做什么。
             ExchangeEvent::Rejected { .. } | ExchangeEvent::Canceled(_) => Vec::new(),
         }
     }
 
-    /// 检测对冲阶段是否切换了（None↔Dynamic↔Ev），切换时重置 Taker 步数。
-    fn sync_hedge_phase(&mut self) {
+    /// 检测对冲阶段是否切换了（None↔Dynamic↔Ev），切换时重置 Taker 步数并清场。
+    /// 阶段切换时产出 CancelAll（撤掉上一阶段的挂单，从干净状态开始新阶段）。
+    fn sync_hedge_phase(&mut self) -> Vec<Command> {
         let phase = HedgePhase::of(self.state_machine.state());
         if phase != self.hedge_phase {
             self.hedge_phase = phase;
             self.taker_steps = 0;
+            self.pending_orders.clear();
+            vec![Command::CancelAll]
+        } else {
+            Vec::new()
         }
     }
 
@@ -263,9 +282,16 @@ impl Engine {
 
     /// 用当前账本和行情让状态机评估一次，看要不要跳转状态。
     fn drive_state_machine(&mut self) -> Transition {
+        let step_budget = self.config.hedge_attack_pool * self.config.hedge_step_fraction;
+        // 步数用完且还有预算 → 告诉 FSM 可以回退做市再来一轮。
+        // 预算耗尽则不回退，扛到交割。
+        let hedge_exhausted = self.hedge_phase.is_hedging()
+            && self.taker_steps >= self.config.max_taker_steps
+            && self.hedge_budget_remaining >= step_budget;
         let inputs = StepInputs {
             position: self.ledger.snapshot(),
             market: self.market,
+            hedge_exhausted,
         };
         self.state_machine.step(&inputs)
     }
@@ -302,7 +328,7 @@ impl Engine {
         self.current_generation = self.current_generation.next();
         let commands: Vec<Command> = self
             .ladder
-            .hedge_taker_step(
+            .hedge_gradient_step(
                 side,
                 cap,
                 &self.market,
@@ -614,7 +640,7 @@ mod tests {
         engine.start();
         // Down 侧重仓成交 100 股、花 60 → 总持仓 100 ≥ min_qty，
         // up_win_pnl = 0 - 60 = -60 ≤ -30 且 down_win_pnl = 100 - 60 = 40 > 0（单边穿线）。
-        // 触发动态对冲，追买瘸腿侧 Up。
+        // 触发动态对冲，追买瘸腿侧 Up（PnL 更小的一侧）。
         let commands = engine.handle_event(ExchangeEvent::Filled(Fill {
             order_id: OrderId(0),
             side: Side::Down,
@@ -626,10 +652,14 @@ mod tests {
             generation: Generation(1),
         }));
         assert!(matches!(engine.state(), RobotState::DynamicHedging { .. }));
-        // 首发对冲：一条 Up 侧 Taker 买单，价取 Up 卖一 0.10。
-        // 预算 = 对冲池 225 × 0.2 = 45 → 可买 45/0.10 = 450 股，但受摽齐缺口 100 封顶。
-        assert_eq!(commands.len(), 1);
-        match &commands[0] {
+        // 阶段切换产出 CancelAll + 对冲梯度指令。
+        // cap = 100 - 0 = 100（摽齐缺口）。预算 45，Taker: min(45×0.40/0.10=180, 100)=100 股。
+        // 剩余 cap=0 → Maker 不铺。所以 CancelAll + 1 Taker = 2 条。
+        assert_eq!(commands.len(), 2);
+        // 第 1 条：阶段切换的 CancelAll。
+        assert_eq!(commands[0], Command::CancelAll);
+        // 第 2 条：Up 侧 Taker。
+        match &commands[1] {
             Command::SubmitOrder(o) => {
                 assert_eq!(o.side, Side::Up);
                 assert_eq!(o.role, OrderRole::Taker);
@@ -722,9 +752,9 @@ mod tests {
         };
         engine.hedge_phase = HedgePhase::Ev;
         engine.taker_steps = 0;
-        // 第一步：产出 Taker。
+        // 第一步：产出梯度指令（1 Taker + N Maker）。
         let first = engine.hedge_step();
-        assert_eq!(first.len(), 1);
+        assert!(!first.is_empty());
         assert_eq!(engine.taker_steps, 1);
         // 同一 tick 第二步：被标记拦截，不产指令。
         let second = engine.hedge_step();
@@ -747,13 +777,13 @@ mod tests {
         engine.hedge_phase = HedgePhase::Ev;
         engine.taker_steps = 0;
         // 第一步成功。
-        assert_eq!(engine.hedge_step().len(), 1);
+        assert!(!engine.hedge_step().is_empty());
         // 同 tick 被拦。
         assert!(engine.hedge_step().is_empty());
         // 模拟新 tick 到来（BookUpdate 会重置标记）。
         engine.hedge_fired_this_tick = false;
         // 下一步又能打了。
-        assert_eq!(engine.hedge_step().len(), 1);
+        assert!(!engine.hedge_step().is_empty());
         assert_eq!(engine.taker_steps, 2);
     }
 
@@ -819,5 +849,244 @@ mod tests {
             generation: Generation(1),
         }));
         assert_eq!(engine.hedge_budget_remaining, initial_budget);
+    }
+
+    #[test]
+    fn phase_switch_to_dynamic_emits_cancel_all() {
+        let mut engine = engine();
+        engine.handle_event(full_book(dec!(0.05), dec!(0.10), dec!(0.55), dec!(0.60)));
+        engine.start();
+        assert_eq!(engine.state(), RobotState::RangeBoundMaking);
+        // 触发进入 DynamicHedging：单边穿线。
+        let commands = engine.handle_event(ExchangeEvent::Filled(Fill {
+            order_id: OrderId(0),
+            side: Side::Down,
+            direction: OrderDirection::Buy,
+            role: OrderRole::Maker,
+            price: dec!(0.60),
+            filled_qty: dec!(100),
+            cash: dec!(60),
+            generation: Generation(1),
+        }));
+        assert!(matches!(engine.state(), RobotState::DynamicHedging { .. }));
+        // 第一条指令应为阶段切换的 CancelAll。
+        assert_eq!(commands[0], Command::CancelAll);
+    }
+
+    #[test]
+    fn phase_switch_to_ev_emits_cancel_all() {
+        let mut engine = engine();
+        engine.handle_event(full_book(dec!(0.05), dec!(0.10), dec!(0.55), dec!(0.60)));
+        engine.start();
+        // 先进入 DynamicHedging。
+        engine.handle_event(ExchangeEvent::Filled(Fill {
+            order_id: OrderId(0),
+            side: Side::Down,
+            direction: OrderDirection::Buy,
+            role: OrderRole::Maker,
+            price: dec!(0.60),
+            filled_qty: dec!(100),
+            cash: dec!(60),
+            generation: Generation(1),
+        }));
+        assert!(matches!(engine.state(), RobotState::DynamicHedging { .. }));
+        // 制造双边穿线直接进 Ev（从 RangeBoundMaking 双边穿线直达 Ev 的路径）。
+        // 这里通过两次 both_sides_negative 升级：第一次 count 0→1，第二次升 Ev。
+        // 构造 both_sides_negative 数据：up_pnl = 100-200 = -100, down_pnl = 50-200 = -150。
+        // 但要注意当前持仓是 down=100, cost=60。再加一笔让双边负。
+        // 直接手动设置状态来简化测试。
+        engine.hedge_phase = HedgePhase::Dynamic;
+        // 模拟一笔成交让状态升级到 EvHedging：
+        // 当前 down=100, cost=60。再买 Up 50 股花 50 → up=50, down=100, cost=110。
+        // up_pnl = 50-110=-60, down_pnl = 100-110=-10 → both_sides_negative → count 0→1。
+        engine.handle_event(ExchangeEvent::Filled(Fill {
+            order_id: OrderId(1),
+            side: Side::Up,
+            direction: OrderDirection::Buy,
+            role: OrderRole::Taker,
+            price: dec!(0.10),
+            filled_qty: dec!(50),
+            cash: dec!(50),
+            generation: Generation(2),
+        }));
+        // count 从 0 到 1，仍在 Dynamic，HedgePhase 没变。
+        assert!(matches!(
+            engine.state(),
+            RobotState::DynamicHedging {
+                double_negative_count: 1
+            }
+        ));
+        // 第二次 both_sides_negative → 升级到 Ev。
+        // 再买 Up 20 股花 20 → up=70, down=100, cost=130。
+        // up_pnl = 70-130=-60, down_pnl = 100-130=-30 → both_sides_negative → 升 Ev。
+        let commands = engine.handle_event(ExchangeEvent::Filled(Fill {
+            order_id: OrderId(2),
+            side: Side::Up,
+            direction: OrderDirection::Buy,
+            role: OrderRole::Taker,
+            price: dec!(0.10),
+            filled_qty: dec!(20),
+            cash: dec!(20),
+            generation: Generation(2),
+        }));
+        assert_eq!(engine.state(), RobotState::EvHedging);
+        // Dynamic → Ev 切换，应包含 CancelAll。
+        assert!(commands.contains(&Command::CancelAll));
+    }
+
+    #[test]
+    fn phase_switch_clears_pending_orders() {
+        let mut engine = engine();
+        // Up Ask 0.40，Down Ask 仅 0.55（配对价 0.58 ≥ 0.55 → 产生 Pending）。
+        engine.handle_event(book_update_both(dec!(0.40), dec!(0.55)));
+        engine.start();
+        // 成交触发配对挂起。
+        engine.handle_event(current_fill(Side::Up, dec!(0.40), dec!(50), dec!(20)));
+        // 此时应有 pending order。
+        assert!(!engine.pending_orders.is_empty());
+        // 触发阶段切换（制造穿线进入 DynamicHedging）。
+        // 再来一笔大额 Down 成交让 up_pnl 穿线。
+        // 当前 up=50, cost=20。再 Down 成交 100 股花 60 → up=50, down=100, cost=80。
+        // up_pnl = 50-80=-30 ≤ -30 且总持仓 150 ≥ 100 → 触发。
+        engine.handle_event(ExchangeEvent::Filled(Fill {
+            order_id: OrderId(5),
+            side: Side::Down,
+            direction: OrderDirection::Buy,
+            role: OrderRole::Maker,
+            price: dec!(0.55),
+            filled_qty: dec!(100),
+            cash: dec!(60),
+            generation: Generation(1),
+        }));
+        assert!(matches!(engine.state(), RobotState::DynamicHedging { .. }));
+        // 阶段切换后 pending_orders 应被清空。
+        assert!(engine.pending_orders.is_empty());
+    }
+
+    #[test]
+    fn double_negative_count_increment_does_not_cancel() {
+        let mut engine = engine();
+        engine.handle_event(full_book(dec!(0.05), dec!(0.10), dec!(0.55), dec!(0.60)));
+        engine.start();
+        // 进入 DynamicHedging。
+        engine.handle_event(ExchangeEvent::Filled(Fill {
+            order_id: OrderId(0),
+            side: Side::Down,
+            direction: OrderDirection::Buy,
+            role: OrderRole::Maker,
+            price: dec!(0.60),
+            filled_qty: dec!(100),
+            cash: dec!(60),
+            generation: Generation(1),
+        }));
+        assert!(matches!(
+            engine.state(),
+            RobotState::DynamicHedging {
+                double_negative_count: 0
+            }
+        ));
+        // 制造 both_sides_negative 让 count 从 0 升到 1（不切换 HedgePhase）。
+        // 当前 down=100, cost=60。买 Up 50 花 50 → up=50, down=100, cost=110。
+        // up_pnl=-60, down_pnl=-10 → both_sides_negative → count 1。
+        let commands = engine.handle_event(ExchangeEvent::Filled(Fill {
+            order_id: OrderId(1),
+            side: Side::Up,
+            direction: OrderDirection::Buy,
+            role: OrderRole::Taker,
+            price: dec!(0.10),
+            filled_qty: dec!(50),
+            cash: dec!(50),
+            generation: Generation(2),
+        }));
+        assert!(matches!(
+            engine.state(),
+            RobotState::DynamicHedging {
+                double_negative_count: 1
+            }
+        ));
+        // count 自增不触发 CancelAll（HedgePhase 仍是 Dynamic，没切换）。
+        assert!(!commands.contains(&Command::CancelAll));
+    }
+
+    #[test]
+    fn hedge_exhausted_triggers_cancel_and_redeploy() {
+        let mut engine = engine();
+        engine.handle_event(full_book(dec!(0.05), dec!(0.10), dec!(0.55), dec!(0.60)));
+        engine.start();
+        // 进入 DynamicHedging。
+        engine.handle_event(ExchangeEvent::Filled(Fill {
+            order_id: OrderId(0),
+            side: Side::Down,
+            direction: OrderDirection::Buy,
+            role: OrderRole::Maker,
+            price: dec!(0.60),
+            filled_qty: dec!(100),
+            cash: dec!(60),
+            generation: Generation(1),
+        }));
+        assert!(matches!(engine.state(), RobotState::DynamicHedging { .. }));
+        // 步数设满 + 预算充足 → hedge_exhausted=true → 回退 RangeBoundMaking。
+        engine.taker_steps = engine.config.max_taker_steps;
+        assert!(engine.hedge_budget_remaining >= engine.config.hedge_attack_pool * engine.config.hedge_step_fraction);
+        let commands =
+            engine.handle_event(full_book(dec!(0.05), dec!(0.10), dec!(0.55), dec!(0.60)));
+        assert_eq!(engine.state(), RobotState::RangeBoundMaking);
+        // 应包含 CancelAll（阶段切换清场）+ SubmitOrder（重铺梯度）。
+        assert!(commands.contains(&Command::CancelAll));
+        assert!(commands.iter().any(|c| matches!(c, Command::SubmitOrder(_))));
+    }
+
+    #[test]
+    fn budget_exhausted_stays_in_hedging() {
+        let mut engine = engine();
+        engine.handle_event(full_book(dec!(0.05), dec!(0.10), dec!(0.55), dec!(0.60)));
+        engine.start();
+        // 进入 DynamicHedging。
+        engine.handle_event(ExchangeEvent::Filled(Fill {
+            order_id: OrderId(0),
+            side: Side::Down,
+            direction: OrderDirection::Buy,
+            role: OrderRole::Maker,
+            price: dec!(0.60),
+            filled_qty: dec!(100),
+            cash: dec!(60),
+            generation: Generation(1),
+        }));
+        assert!(matches!(engine.state(), RobotState::DynamicHedging { .. }));
+        // 步数满 + 预算耗尽 → 不回退。
+        engine.taker_steps = engine.config.max_taker_steps;
+        engine.hedge_budget_remaining = dec!(0);
+        let commands =
+            engine.handle_event(full_book(dec!(0.05), dec!(0.10), dec!(0.55), dec!(0.60)));
+        // 应留在 DynamicHedging（扛到交割）。
+        assert!(matches!(engine.state(), RobotState::DynamicHedging { .. }));
+        assert!(!commands.contains(&Command::CancelAll));
+    }
+
+    #[test]
+    fn reentry_after_return_resets_steps() {
+        let mut engine = engine();
+        engine.handle_event(full_book(dec!(0.05), dec!(0.10), dec!(0.55), dec!(0.60)));
+        engine.start();
+        // 进入 DynamicHedging。
+        engine.handle_event(ExchangeEvent::Filled(Fill {
+            order_id: OrderId(0),
+            side: Side::Down,
+            direction: OrderDirection::Buy,
+            role: OrderRole::Maker,
+            price: dec!(0.60),
+            filled_qty: dec!(100),
+            cash: dec!(60),
+            generation: Generation(1),
+        }));
+        // 步数设满 → 触发回退。
+        engine.taker_steps = engine.config.max_taker_steps;
+        engine.handle_event(full_book(dec!(0.05), dec!(0.10), dec!(0.55), dec!(0.60)));
+        assert_eq!(engine.state(), RobotState::RangeBoundMaking);
+        // 再触发进入 DynamicHedging（仍穿线：up_pnl=0-60=-60 ≤ -30）。
+        engine.handle_event(full_book(dec!(0.05), dec!(0.10), dec!(0.55), dec!(0.60)));
+        assert!(matches!(engine.state(), RobotState::DynamicHedging { .. }));
+        // 步数应从 0 重新开始。
+        assert_eq!(engine.taker_steps, 0);
     }
 }

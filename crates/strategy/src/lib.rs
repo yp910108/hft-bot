@@ -1,8 +1,9 @@
 //! 策略模块：梯度接低 + 对冲决策。
 //!
-//! 两大块：
+//! 三大块：
 //! 1. **做市**：在便宜侧分层挂买单，成交后自动在对面挂配对单锁利润。
 //! 2. **对冲决策**：判断该追买哪侧、量的上限，供 engine 执行。
+//! 3. **对冲梯度执行**：1 档 Taker 确保响应 + N 档 Maker 等好价省费。
 //!
 //! 纯逻辑模块：吃行情和持仓，吐 [`Command`] 列表或 [`HedgeDecision`]，不碰交易所。
 
@@ -24,6 +25,46 @@ pub struct LadderRung {
     pub price_offset: Decimal,
     /// 用核心做市池的多少比例（0.02 = 2%）。
     pub pool_fraction: Decimal,
+}
+
+/// 对冲梯度中一档 Maker 的参数。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HedgeRung {
+    /// 挂单价 = best_ask - 这个偏移量。
+    pub price_offset: Decimal,
+    /// 占单步预算的比例（0.30 = 30%）。
+    pub budget_fraction: Decimal,
+}
+
+/// 对冲梯度配置：1 档 Taker（立即成交）+ N 档 Maker（等更好价格省费）。
+///
+/// Taker 保证对冲的即时响应能力，Maker 在价格回落时降低整体均价。
+/// 各档预算比例之和应为 1.0（Taker + 所有 Maker）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HedgeGradientConfig {
+    /// Taker 档占单步预算的比例（0.40 = 40%）。
+    pub taker_fraction: Decimal,
+    /// Maker 各档，从近到远排列。
+    pub maker_rungs: Vec<HedgeRung>,
+}
+
+impl Default for HedgeGradientConfig {
+    /// 默认值：Taker 40% + 两档 Maker（偏移 0.01 占 30%、偏移 0.02 占 30%）。
+    fn default() -> Self {
+        Self {
+            taker_fraction: dec!(0.40),
+            maker_rungs: vec![
+                HedgeRung {
+                    price_offset: dec!(0.01),
+                    budget_fraction: dec!(0.30),
+                },
+                HedgeRung {
+                    price_offset: dec!(0.02),
+                    budget_fraction: dec!(0.30),
+                },
+            ],
+        }
+    }
 }
 
 /// 布阵配置：三档梯度 + 主战场判定 + 配对重算参数。
@@ -109,17 +150,21 @@ pub struct RecomputeResult {
 #[derive(Debug, Clone)]
 pub struct GradientLadder {
     config: LadderConfig,
+    hedge_config: HedgeGradientConfig,
 }
 
 impl GradientLadder {
     /// 用指定配置创建。
-    pub fn new(config: LadderConfig) -> Self {
-        Self { config }
+    pub fn new(config: LadderConfig, hedge_config: HedgeGradientConfig) -> Self {
+        Self {
+            config,
+            hedge_config,
+        }
     }
 
     /// 用默认配置创建。
     pub fn with_default_config() -> Self {
-        Self::new(LadderConfig::default())
+        Self::new(LadderConfig::default(), HedgeGradientConfig::default())
     }
 
     /// 选出本轮做市主战场。
@@ -325,6 +370,99 @@ impl GradientLadder {
             generation,
         })]
     }
+
+    /// 对冲梯度单步：产出 1 条 Taker + N 条 Maker 买单。
+    ///
+    /// 第 1 档 Taker 以 best_ask 立即成交（确保对冲响应），
+    /// 后续各档 Maker 以更低价被动挂单等成交（省 4% 手续费）。
+    /// cap（摽齐缺口）按顺序扣减：Taker 先用，剩下的分给 Maker。
+    #[allow(clippy::too_many_arguments)]
+    pub fn hedge_gradient_step(
+        &self,
+        side: Side,
+        cap: Option<Qty>,
+        market: &MarketSnapshot,
+        step_budget: Money,
+        constraints: &OrderConstraints,
+        id_generator: &mut OrderIdGenerator,
+        generation: Generation,
+    ) -> Vec<Command> {
+        // 摽齐缺口已补完，不再追买。
+        if matches!(cap, Some(gap) if gap <= Decimal::ZERO) {
+            return Vec::new();
+        }
+        // 没有卖一价就无法确定基准价格。
+        let Some(best_ask) = market.book(side).best_ask else {
+            return Vec::new();
+        };
+        if best_ask <= Decimal::ZERO {
+            return Vec::new();
+        }
+
+        let mut commands = Vec::new();
+        let mut remaining_cap = cap; // None 表示无上限
+
+        // — 第 1 档：Taker，以 best_ask 吃单 —
+        let taker_budget = step_budget * self.hedge_config.taker_fraction;
+        let taker_qty = Self::calc_rung_qty(taker_budget, best_ask, remaining_cap, constraints);
+        if constraints.is_satisfied(taker_qty, best_ask) {
+            commands.push(Command::SubmitOrder(Order {
+                order_id: id_generator.next(),
+                side,
+                direction: OrderDirection::Buy,
+                price: best_ask,
+                qty: taker_qty,
+                role: OrderRole::Taker,
+                generation,
+            }));
+            remaining_cap = remaining_cap.map(|c| c - taker_qty);
+        }
+
+        // — 后续各档：Maker，以 best_ask - offset 被动挂单 —
+        for rung in &self.hedge_config.maker_rungs {
+            // cap 已耗尽，不再铺。
+            if matches!(remaining_cap, Some(c) if c <= Decimal::ZERO) {
+                break;
+            }
+            let maker_price = constraints.quantize_price(best_ask - rung.price_offset);
+            if maker_price <= Decimal::ZERO {
+                continue;
+            }
+            let maker_budget = step_budget * rung.budget_fraction;
+            let maker_qty =
+                Self::calc_rung_qty(maker_budget, maker_price, remaining_cap, constraints);
+            if !constraints.is_satisfied(maker_qty, maker_price) {
+                continue;
+            }
+            commands.push(Command::SubmitOrder(Order {
+                order_id: id_generator.next(),
+                side,
+                direction: OrderDirection::Buy,
+                price: maker_price,
+                qty: maker_qty,
+                role: OrderRole::Maker,
+                generation,
+            }));
+            remaining_cap = remaining_cap.map(|c| c - maker_qty);
+        }
+
+        commands
+    }
+
+    /// 计算某档对冲的下单量：取预算可买量和剩余 cap 的较小值，再量化。
+    fn calc_rung_qty(
+        budget: Money,
+        price: Price,
+        remaining_cap: Option<Qty>,
+        constraints: &OrderConstraints,
+    ) -> Qty {
+        let budget_qty = budget / price;
+        let target_qty = match remaining_cap {
+            Some(cap) => budget_qty.min(cap),
+            None => budget_qty,
+        };
+        constraints.quantize_qty(target_qty)
+    }
 }
 
 /// 对冲阶段的粗分类。
@@ -370,7 +508,8 @@ pub enum HedgeDecision {
 impl GradientLadder {
     /// 决定对冲该追买哪侧、量的上限。纯决策，不产出订单。
     ///
-    /// - Dynamic 阶段：找瘸腿侧，cap = 对面持仓 - 本侧持仓（补到摽齐）。
+    /// - Dynamic 阶段：追买 PnL 更小的一侧，纯预算封顶（不看穿线、不用摽齐缺口）。
+    ///   利润已锁定或两侧 PnL 相等时返回 Skip。
     /// - Ev 阶段：找优势方（mark_price > 0.5 的那侧），cap = None（纯靠预算封顶）。
     /// - None 阶段：返回 Skip。
     pub fn decide_hedge_step(
@@ -378,15 +517,19 @@ impl GradientLadder {
         phase: HedgePhase,
         position: &PositionSnapshot,
         market: &MarketSnapshot,
-        thresholds: &Thresholds,
+        _thresholds: &Thresholds,
     ) -> HedgeDecision {
         match phase {
             HedgePhase::Dynamic => {
-                let Some(side) =
-                    position.breached_side(thresholds.hedge_loss_trigger, thresholds.hedge_min_qty)
-                else {
+                // 双边都为正 → 已锁定利润，不需要再追。
+                if position.is_profit_locked() {
+                    return HedgeDecision::Skip;
+                }
+                // 追买 PnL 更小的那一侧；两侧相等则不追。
+                let Some(side) = position.weaker_side() else {
                     return HedgeDecision::Skip;
                 };
+                // 摽齐缺口：补到两边持仓对齐就停，防止把对面 PnL 打成负的。
                 let gap = position.qty(side.opposite()) - position.qty(side);
                 HedgeDecision::Execute {
                     side,
@@ -927,10 +1070,10 @@ mod tests {
     }
 
     #[test]
-    fn decide_hedge_dynamic_finds_lame_side() {
+    fn decide_hedge_dynamic_chases_weaker_side() {
         let ladder = GradientLadder::with_default_config();
-        // Up 20 股、Down 100 股、总成本 80 → up_pnl = 20-80 = -60 ≤ -30，穿线。
-        // 总持仓 120 ≥ min_qty 100。瘸腿侧 = Up，cap = 100 - 20 = 80。
+        // up_pnl = 20-80 = -60, down_pnl = 100-80 = 20。Up 更弱，追买 Up。
+        // cap = opposite_qty - own_qty = 100 - 20 = 80（摽齐缺口）。
         let pos = position(dec!(20), dec!(100), dec!(80));
         let decision = ladder.decide_hedge_step(
             HedgePhase::Dynamic,
@@ -945,10 +1088,10 @@ mod tests {
     }
 
     #[test]
-    fn decide_hedge_dynamic_skips_when_qty_insufficient() {
+    fn decide_hedge_dynamic_skips_when_profit_locked() {
         let ladder = GradientLadder::with_default_config();
-        // 总持仓 30 < min_qty 100 → 不触发，即使 PnL 穿线。
-        let pos = position(dec!(10), dec!(20), dec!(80));
+        // up_pnl = 100-80 = 20 > 0, down_pnl = 100-80 = 20 > 0 → 利润已锁定。
+        let pos = position(dec!(100), dec!(100), dec!(80));
         let decision = ladder.decide_hedge_step(
             HedgePhase::Dynamic,
             &pos,
@@ -956,6 +1099,39 @@ mod tests {
             &thresholds(),
         );
         assert_eq!(decision, HedgeDecision::Skip);
+    }
+
+    #[test]
+    fn decide_hedge_dynamic_skips_when_pnl_equal() {
+        let ladder = GradientLadder::with_default_config();
+        // up_pnl = 50-80 = -30, down_pnl = 50-80 = -30。两侧相等，不追。
+        let pos = position(dec!(50), dec!(50), dec!(80));
+        let decision = ladder.decide_hedge_step(
+            HedgePhase::Dynamic,
+            &pos,
+            &market(Some(dec!(0.40)), Some(dec!(0.60))),
+            &thresholds(),
+        );
+        assert_eq!(decision, HedgeDecision::Skip);
+    }
+
+    #[test]
+    fn decide_hedge_dynamic_chases_even_when_not_breached() {
+        let ladder = GradientLadder::with_default_config();
+        // up_pnl = 90-100 = -10（未穿 -30 线），down_pnl = 120-100 = 20。
+        // 旧逻辑会 Skip（因为不穿线），新逻辑追买 Up（PnL 更小）。
+        // cap = 120 - 90 = 30（摽齐缺口）。
+        let pos = position(dec!(90), dec!(120), dec!(100));
+        let decision = ladder.decide_hedge_step(
+            HedgePhase::Dynamic,
+            &pos,
+            &market(Some(dec!(0.40)), Some(dec!(0.60))),
+            &thresholds(),
+        );
+        assert!(matches!(
+            decision,
+            HedgeDecision::Execute { side: Side::Up, cap: Some(gap) } if gap == dec!(30)
+        ));
     }
 
     #[test]
@@ -1013,5 +1189,277 @@ mod tests {
             &thresholds(),
         );
         assert_eq!(decision, HedgeDecision::Skip);
+    }
+
+    // ==================== hedge_gradient_step 测试 ====================
+
+    #[test]
+    fn hedge_gradient_produces_taker_and_makers() {
+        let ladder = GradientLadder::with_default_config();
+        let mut generator = OrderIdGenerator::new();
+        // EV 模式（cap=None），预算 100，best_ask 0.50。
+        // Taker: 100×0.40/0.50 = 80 股
+        // Maker1: 100×0.30/0.49 ≈ 61.22 股
+        // Maker2: 100×0.30/0.48 = 62.50 股
+        let commands = ladder.hedge_gradient_step(
+            Side::Up,
+            None,
+            &market_one_side_ask(Side::Up, dec!(0.50)),
+            dec!(100),
+            &OrderConstraints::default(),
+            &mut generator,
+            Generation::new(),
+        );
+        assert_eq!(commands.len(), 3);
+        // 第 1 条：Taker，价 0.50。
+        match &commands[0] {
+            Command::SubmitOrder(o) => {
+                assert_eq!(o.role, OrderRole::Taker);
+                assert_eq!(o.price, dec!(0.50));
+                assert_eq!(o.qty, dec!(80));
+            }
+            _ => panic!("应为 SubmitOrder"),
+        }
+        // 第 2 条：Maker，价 0.49。
+        match &commands[1] {
+            Command::SubmitOrder(o) => {
+                assert_eq!(o.role, OrderRole::Maker);
+                assert_eq!(o.price, dec!(0.49));
+                assert_eq!(o.qty, dec!(61.22));
+            }
+            _ => panic!("应为 SubmitOrder"),
+        }
+        // 第 3 条：Maker，价 0.48。
+        match &commands[2] {
+            Command::SubmitOrder(o) => {
+                assert_eq!(o.role, OrderRole::Maker);
+                assert_eq!(o.price, dec!(0.48));
+                assert_eq!(o.qty, dec!(62.50));
+            }
+            _ => panic!("应为 SubmitOrder"),
+        }
+    }
+
+    #[test]
+    fn hedge_gradient_cap_consumed_by_taker() {
+        let ladder = GradientLadder::with_default_config();
+        let mut generator = OrderIdGenerator::new();
+        // cap 仅 30 股，Taker 预算可买 80 股但受 cap 封顶为 30 → Maker 无余额。
+        let commands = ladder.hedge_gradient_step(
+            Side::Up,
+            Some(dec!(30)),
+            &market_one_side_ask(Side::Up, dec!(0.50)),
+            dec!(100),
+            &OrderConstraints::default(),
+            &mut generator,
+            Generation::new(),
+        );
+        // 只有 Taker 一条（cap 被 Taker 耗尽）。
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            Command::SubmitOrder(o) => {
+                assert_eq!(o.role, OrderRole::Taker);
+                assert_eq!(o.qty, dec!(30));
+            }
+            _ => panic!("应为 SubmitOrder"),
+        }
+    }
+
+    #[test]
+    fn hedge_gradient_partial_cap_for_makers() {
+        let ladder = GradientLadder::with_default_config();
+        let mut generator = OrderIdGenerator::new();
+        // cap = 100，Taker 预算可买 80 → 剩余 cap 20 给 Maker。
+        // Maker1 预算可买 61.22 但受 cap 封顶为 20 → 剩余 cap 0，Maker2 不铺。
+        let commands = ladder.hedge_gradient_step(
+            Side::Up,
+            Some(dec!(100)),
+            &market_one_side_ask(Side::Up, dec!(0.50)),
+            dec!(100),
+            &OrderConstraints::default(),
+            &mut generator,
+            Generation::new(),
+        );
+        assert_eq!(commands.len(), 2); // Taker + Maker1
+        match &commands[0] {
+            Command::SubmitOrder(o) => {
+                assert_eq!(o.role, OrderRole::Taker);
+                assert_eq!(o.qty, dec!(80));
+            }
+            _ => panic!("应为 SubmitOrder"),
+        }
+        match &commands[1] {
+            Command::SubmitOrder(o) => {
+                assert_eq!(o.role, OrderRole::Maker);
+                assert_eq!(o.price, dec!(0.49));
+                assert_eq!(o.qty, dec!(20)); // 受 remaining_cap 封顶
+            }
+            _ => panic!("应为 SubmitOrder"),
+        }
+    }
+
+    #[test]
+    fn hedge_gradient_skips_maker_below_min_size() {
+        let ladder = GradientLadder::with_default_config();
+        let mut generator = OrderIdGenerator::new();
+        // cap=10，best_ask=0.50。
+        // Taker: min(100×0.40/0.50=80, cap=10) = 10 股，剩余 cap=0 → Maker 全跳过。
+        let commands = ladder.hedge_gradient_step(
+            Side::Up,
+            Some(dec!(10)),
+            &market_one_side_ask(Side::Up, dec!(0.50)),
+            dec!(100),
+            &OrderConstraints::default(),
+            &mut generator,
+            Generation::new(),
+        );
+        // Taker 10 股，剩余 cap 0 → 所有 Maker 都跳过。
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            Command::SubmitOrder(o) => {
+                assert_eq!(o.role, OrderRole::Taker);
+                assert_eq!(o.qty, dec!(10));
+            }
+            _ => panic!("应为 SubmitOrder"),
+        }
+    }
+
+    #[test]
+    fn hedge_gradient_skips_maker_when_price_non_positive() {
+        let ladder = GradientLadder::with_default_config();
+        let mut generator = OrderIdGenerator::new();
+        // best_ask = 0.02，Maker1 价 = 0.02-0.01 = 0.01 > 0 → OK。
+        // Maker2 价 = 0.02-0.02 = 0.00 ≤ 0 → 跳过。
+        // 但 Taker 预算可买量 = 100×0.40/0.02 = 2000 股（cap=None）。
+        let commands = ladder.hedge_gradient_step(
+            Side::Up,
+            None,
+            &market_one_side_ask(Side::Up, dec!(0.02)),
+            dec!(100),
+            &OrderConstraints::default(),
+            &mut generator,
+            Generation::new(),
+        );
+        // Taker + Maker1（Maker2 价格为 0 被跳过）。
+        assert_eq!(commands.len(), 2);
+        match &commands[1] {
+            Command::SubmitOrder(o) => {
+                assert_eq!(o.role, OrderRole::Maker);
+                assert_eq!(o.price, dec!(0.01));
+            }
+            _ => panic!("应为 SubmitOrder"),
+        }
+    }
+
+    #[test]
+    fn hedge_gradient_ev_no_cap_all_rungs_by_budget() {
+        let ladder = GradientLadder::with_default_config();
+        let mut generator = OrderIdGenerator::new();
+        // EV 模式无 cap 约束，各档纯预算封顶。预算 200，best_ask 0.40。
+        let commands = ladder.hedge_gradient_step(
+            Side::Down,
+            None,
+            &market_one_side_ask(Side::Down, dec!(0.40)),
+            dec!(200),
+            &OrderConstraints::default(),
+            &mut generator,
+            Generation::new(),
+        );
+        assert_eq!(commands.len(), 3);
+        // Taker: 200×0.40/0.40 = 200 股
+        match &commands[0] {
+            Command::SubmitOrder(o) => {
+                assert_eq!(o.side, Side::Down);
+                assert_eq!(o.role, OrderRole::Taker);
+                assert_eq!(o.qty, dec!(200));
+            }
+            _ => panic!("应为 SubmitOrder"),
+        }
+        // Maker1: 200×0.30/0.39 ≈ 153.84 股
+        match &commands[1] {
+            Command::SubmitOrder(o) => {
+                assert_eq!(o.role, OrderRole::Maker);
+                assert_eq!(o.price, dec!(0.39));
+                assert_eq!(o.qty, dec!(153.84));
+            }
+            _ => panic!("应为 SubmitOrder"),
+        }
+        // Maker2: 200×0.30/0.38 ≈ 157.89 股
+        match &commands[2] {
+            Command::SubmitOrder(o) => {
+                assert_eq!(o.role, OrderRole::Maker);
+                assert_eq!(o.price, dec!(0.38));
+                assert_eq!(o.qty, dec!(157.89));
+            }
+            _ => panic!("应为 SubmitOrder"),
+        }
+    }
+
+    #[test]
+    fn hedge_gradient_empty_when_no_ask() {
+        let ladder = GradientLadder::with_default_config();
+        let mut generator = OrderIdGenerator::new();
+        // 该侧无卖一价 → 无基准价，返回空。
+        let commands = ladder.hedge_gradient_step(
+            Side::Up,
+            Some(dec!(100)),
+            &MarketSnapshot::default(),
+            dec!(100),
+            &OrderConstraints::default(),
+            &mut generator,
+            Generation::new(),
+        );
+        assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn hedge_gradient_empty_when_gap_non_positive() {
+        let ladder = GradientLadder::with_default_config();
+        let mut generator = OrderIdGenerator::new();
+        // cap = 0（已摽齐）→ 不再补，返回空。
+        let commands = ladder.hedge_gradient_step(
+            Side::Up,
+            Some(dec!(0)),
+            &market_one_side_ask(Side::Up, dec!(0.50)),
+            dec!(100),
+            &OrderConstraints::default(),
+            &mut generator,
+            Generation::new(),
+        );
+        assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn hedge_gradient_taker_skip_but_maker_still_tries() {
+        // Taker 预算太小不够最小量，但 Maker 价更低能买更多股。
+        let config = HedgeGradientConfig {
+            taker_fraction: dec!(0.05), // 极小的 Taker 比例
+            maker_rungs: vec![HedgeRung {
+                price_offset: dec!(0.01),
+                budget_fraction: dec!(0.95),
+            }],
+        };
+        let ladder = GradientLadder::new(LadderConfig::default(), config);
+        let mut generator = OrderIdGenerator::new();
+        // 预算 10，best_ask 0.50。
+        // Taker: 10×0.05/0.50 = 1 股 < min_size 5 → 跳过。
+        // Maker: 10×0.95/0.49 ≈ 19.38 股 ≥ 5 → 产出。
+        let commands = ladder.hedge_gradient_step(
+            Side::Up,
+            None,
+            &market_one_side_ask(Side::Up, dec!(0.50)),
+            dec!(10),
+            &OrderConstraints::default(),
+            &mut generator,
+            Generation::new(),
+        );
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            Command::SubmitOrder(o) => {
+                assert_eq!(o.role, OrderRole::Maker);
+                assert_eq!(o.price, dec!(0.49));
+            }
+            _ => panic!("应为 SubmitOrder"),
+        }
     }
 }
