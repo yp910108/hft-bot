@@ -11,10 +11,11 @@ pub enum RobotState {
     Initialization,
     /// 区间做市：常规梯度接低循环，纯 Maker 被动撮合。
     RangeBoundMaking,
-    /// 动态对冲：单边瘸腿触发复合对冲边界后，Taker + Maker 交替防御。
+    /// 动态对冲：单边亏损穿线后，Taker 追买瘸腿侧补到摽齐。
     ///
-    /// `double_negative_count` 记录在本状态下「两边条件 PnL 同时为负」已发生的次数：
-    /// 第一次发生时放大亏损上限、继续对冲；累计第二次则升级进入 [`RobotState::EvHedging`]。
+    /// `double_negative_count` 记录"两边 PnL 同时为负"出现了几次。
+    /// 这个计数只用于升级判定（连续两次双边负 → 升级到 EvHedging），
+    /// 不影响对冲的执行行为——无论 count 是 0 还是 1，追买动作一样。
     DynamicHedging { double_negative_count: u8 },
     /// EV 对冲：连续两次双边均负后，转入数学期望兜底模式。
     EvHedging,

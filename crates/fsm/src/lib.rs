@@ -107,8 +107,13 @@ impl StateMachine {
                 if self.profit_target_reached(&inputs.position) {
                     RobotState::FinalSettlement
                 } else if self.hedge_boundary_triggered(&inputs.position) {
-                    RobotState::DynamicHedging {
-                        double_negative_count: 0,
+                    // 两边同时亏 → 补哪边都没用，直接进 EV 对冲按胜率追买。
+                    if inputs.position.both_sides_negative() {
+                        RobotState::EvHedging
+                    } else {
+                        RobotState::DynamicHedging {
+                            double_negative_count: 0,
+                        }
                     }
                 } else {
                     RobotState::RangeBoundMaking
@@ -156,14 +161,9 @@ impl StateMachine {
 
     /// 是否该触发对冲：某边亏损穿线，且总持仓够大（排除开局误报）。
     fn hedge_boundary_triggered(&self, position: &PositionSnapshot) -> bool {
-        let total_qty = position.up_qty + position.down_qty;
-        if total_qty < self.thresholds.hedge_min_qty {
-            return false;
-        }
-        let up_pnl = position.up_win_pnl();
-        let down_pnl = position.down_win_pnl();
-        up_pnl <= -self.thresholds.hedge_loss_trigger
-            || down_pnl <= -self.thresholds.hedge_loss_trigger
+        position
+            .breached_side(self.thresholds.hedge_loss_trigger, self.thresholds.hedge_min_qty)
+            .is_some()
     }
 }
 
@@ -283,12 +283,13 @@ mod tests {
         let transition = machine.step(&inputs);
         assert_eq!(transition.state(), RobotState::RangeBoundMaking);
 
-        // 总持仓增加到 150 ≥ 100 → 触发。
+        // 总持仓 ≥ 100，仅单边穿线（up_pnl = 50-180 = -130 ≤ -30），
+        // 但 down_pnl = 150-180 = -30，不算严格穿透（要 ≤ -30 才算，边界不触发 both_sides_negative 因为 down > 0 不成立...）
+        // 换个数据：up_pnl = 20-80 = -60 ≤ -30, down_pnl = 100-80 = 20 > 0。单边穿线。
         let inputs2 = StepInputs {
-            position: position(dec!(50), dec!(100), dec!(180)),
+            position: position(dec!(20), dec!(100), dec!(80)),
             market: neutral_market(),
         };
-        // up_pnl = 50 - 180 = -130 ≤ -30, total_qty = 150 ≥ 100 → 触发对冲。
         let transition2 = machine.step(&inputs2);
         assert_eq!(
             transition2.state(),
@@ -315,11 +316,15 @@ mod tests {
     fn dynamic_hedging_first_double_negative_increments_count() {
         let mut machine = StateMachine::new(thresholds());
         machine.finish_initialization();
-        // 先进入对冲（总持仓 150 ≥ 100，up_pnl = -130）。
+        // 单边穿线进入 DynamicHedging：up_pnl = 20-80 = -60 ≤ -30, down_pnl = 100-80 = 20 > 0。
         machine.step(&StepInputs {
-            position: position(dec!(50), dec!(100), dec!(180)),
+            position: position(dec!(20), dec!(100), dec!(80)),
             market: neutral_market(),
         });
+        assert_eq!(
+            machine.state(),
+            RobotState::DynamicHedging { double_negative_count: 0 }
+        );
         // 两边均负：up_pnl = 40-100=-60，down_pnl = 50-100=-50。第一次 → 计数 1。
         let transition = machine.step(&StepInputs {
             position: position(dec!(40), dec!(50), dec!(100)),
@@ -338,8 +343,9 @@ mod tests {
     fn dynamic_hedging_second_double_negative_escalates_to_ev() {
         let mut machine = StateMachine::new(thresholds());
         machine.finish_initialization();
+        // 单边穿线进入 DynamicHedging。
         machine.step(&StepInputs {
-            position: position(dec!(50), dec!(100), dec!(180)),
+            position: position(dec!(20), dec!(100), dec!(80)),
             market: neutral_market(),
         });
         let double_negative = StepInputs {
@@ -355,8 +361,9 @@ mod tests {
     fn dynamic_hedging_to_final_settlement_when_profit_locked() {
         let mut machine = StateMachine::new(thresholds());
         machine.finish_initialization();
+        // 单边穿线进入 DynamicHedging。
         machine.step(&StepInputs {
-            position: position(dec!(50), dec!(100), dec!(180)),
+            position: position(dec!(20), dec!(100), dec!(80)),
             market: neutral_market(),
         });
         let transition = machine.step(&StepInputs {
@@ -370,8 +377,9 @@ mod tests {
     fn ev_hedging_to_final_settlement_when_ev_non_negative() {
         let mut machine = StateMachine::new(thresholds());
         machine.finish_initialization();
+        // 单边穿线进入 DynamicHedging。
         machine.step(&StepInputs {
-            position: position(dec!(50), dec!(100), dec!(180)),
+            position: position(dec!(20), dec!(100), dec!(80)),
             market: neutral_market(),
         });
         let double_negative = StepInputs {
@@ -403,5 +411,19 @@ mod tests {
             market: neutral_market(),
         });
         assert!(!transition.is_moved());
+    }
+
+    #[test]
+    fn both_sides_breached_skips_dynamic_goes_to_ev() {
+        let mut machine = StateMachine::new(thresholds());
+        machine.finish_initialization();
+        // 双边同时穿线且 both_sides_negative：
+        // up_pnl = 50-180 = -130, down_pnl = 100-180 = -80，都 ≤ -30，且都 < 0。
+        // 应直接跳 EvHedging，不经过 DynamicHedging。
+        let transition = machine.step(&StepInputs {
+            position: position(dec!(50), dec!(100), dec!(180)),
+            market: neutral_market(),
+        });
+        assert_eq!(transition.state(), RobotState::EvHedging);
     }
 }

@@ -5,7 +5,7 @@
 //! 判定「双向盈利」一律以真实盈亏公式 `min(Q_up, Q_down) > C_total` 为准，
 //! 不使用「双边均价之和 < 1」这一仅在两边股数相等时才等价的近似。
 
-use crate::types::{Money, Qty};
+use crate::types::{Money, Qty, Side};
 
 /// 某一时点的持仓快照，用于计算条件盈亏与数学期望。
 ///
@@ -56,6 +56,28 @@ impl PositionSnapshot {
     pub fn expected_value(&self, up_win_probability: Money) -> Money {
         let q = Money::ONE - up_win_probability;
         up_win_probability * self.up_win_pnl() + q * self.down_win_pnl()
+    }
+
+    /// 找出穿透亏损线的一侧（"瘸腿侧"）。
+    ///
+    /// 条件：总持仓 ≥ min_qty（防开局噪音）且某边 PnL ≤ -loss_trigger。
+    /// 双侧都穿取更亏的那边。都没穿或持仓不够返回 None。
+    pub fn breached_side(&self, loss_trigger: Money, min_qty: Qty) -> Option<Side> {
+        if self.up_qty + self.down_qty < min_qty {
+            return None;
+        }
+        let up_breached = self.up_win_pnl() <= -loss_trigger;
+        let down_breached = self.down_win_pnl() <= -loss_trigger;
+        match (up_breached, down_breached) {
+            (true, true) => Some(if self.up_win_pnl() <= self.down_win_pnl() {
+                Side::Up
+            } else {
+                Side::Down
+            }),
+            (true, false) => Some(Side::Up),
+            (false, true) => Some(Side::Down),
+            _ => None,
+        }
     }
 }
 
@@ -158,5 +180,38 @@ mod tests {
         // p = 1 → EV 退化为 up_win_pnl；p = 0 → EV 退化为 down_win_pnl。
         assert_eq!(pos.expected_value(dec!(1)), dec!(20));
         assert_eq!(pos.expected_value(dec!(0)), dec!(-20));
+    }
+
+    #[test]
+    fn breached_side_returns_none_when_qty_insufficient() {
+        // 总持仓 30 < min_qty 100，即使 PnL 穿透也不触发。
+        let pos = PositionSnapshot {
+            up_qty: dec!(10),
+            down_qty: dec!(20),
+            total_cost: dec!(80),
+        };
+        assert!(pos.breached_side(dec!(30), dec!(100)).is_none());
+    }
+
+    #[test]
+    fn breached_side_returns_up_when_only_up_breached() {
+        // up_pnl = 20 - 80 = -60 ≤ -30, down_pnl = 80 - 80 = 0 > -30。
+        let pos = PositionSnapshot {
+            up_qty: dec!(20),
+            down_qty: dec!(80),
+            total_cost: dec!(80),
+        };
+        assert_eq!(pos.breached_side(dec!(30), dec!(50)), Some(Side::Up));
+    }
+
+    #[test]
+    fn breached_side_picks_deeper_when_both_breached() {
+        // up_pnl = 20 - 100 = -80, down_pnl = 10 - 100 = -90。都 ≤ -30，Down 更亏。
+        let pos = PositionSnapshot {
+            up_qty: dec!(20),
+            down_qty: dec!(10),
+            total_cost: dec!(100),
+        };
+        assert_eq!(pos.breached_side(dec!(30), dec!(0)), Some(Side::Down));
     }
 }

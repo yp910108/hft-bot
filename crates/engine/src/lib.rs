@@ -94,6 +94,10 @@ pub struct Engine {
     hedge_phase: HedgePhase,
     /// 本对冲阶段已发了几步 Taker，达上限就停。
     taker_steps: u32,
+    /// 本 tick 是否已发过对冲 Taker（每次 BookUpdate 重置为 false）。
+    hedge_fired_this_tick: bool,
+    /// 对冲池剩余可用额度（初始 = hedge_attack_pool，每笔对冲成交扣减，跨阶段不重置）。
+    hedge_budget_remaining: Money,
     /// 是否已收手（利润锁定后置 true，之后不再开新仓）。
     settled: bool,
     config: EngineConfig,
@@ -121,6 +125,8 @@ impl Engine {
             pending_orders: Vec::new(),
             hedge_phase: HedgePhase::None,
             taker_steps: 0,
+            hedge_fired_this_tick: false,
+            hedge_budget_remaining: config.hedge_attack_pool,
             settled: false,
             config,
         }
@@ -153,6 +159,7 @@ impl Engine {
         match event {
             ExchangeEvent::BookUpdate(snapshot) => {
                 self.market = snapshot;
+                self.hedge_fired_this_tick = false;
                 self.drive_state_machine();
                 self.sync_hedge_phase();
                 if let Some(settle) = self.enter_settlement_if_locked() {
@@ -170,8 +177,13 @@ impl Engine {
             ExchangeEvent::Filled(fill) => {
                 // 无论新旧世代，成交是既成事实，必须入账（否则账本和交易所不一致）。
                 let is_current = fill.generation >= self.current_generation;
+                let is_hedging = self.hedge_phase.is_hedging();
                 self.ledger.apply_fill(&fill);
                 self.free_cash -= fill.cash;
+                // 对冲阶段的成交同时扣减对冲池预算。
+                if is_hedging {
+                    self.hedge_budget_remaining -= fill.cash;
+                }
                 self.drive_state_machine();
                 self.sync_hedge_phase();
                 if let Some(settle) = self.enter_settlement_if_locked() {
@@ -184,7 +196,6 @@ impl Engine {
                 if self.hedge_phase.is_hedging() {
                     return self.hedge_step();
                 }
-                // TODO 为什么只对"本世代 + 主战场侧"的买入成交触发跨侧配对重算？
                 // 常规阶段：只对"本世代 + 主战场侧"的买入成交触发跨侧配对重算。
                 // 对面配对成交不触发（防滚雪球），旧世代成交也不触发。
                 let is_main_field = self.main_field == Some(fill.side);
@@ -292,9 +303,13 @@ impl Engine {
     }
 
     /// 对冲单步：决定追买哪侧、买多少，产出至多一条 Taker 指令。
-    /// 达到步数上限就停（扛到交割）。只有真的发出了指令才计步（被风控拦截不算）。
+    /// 每个 tick 最多打一步（防止同价连环打光），达步数上限也停。
+    /// 只有真的发出了指令才计步（被风控拦截不算）。
     fn hedge_step(&mut self) -> Vec<Command> {
         if self.taker_steps >= self.config.max_taker_steps {
+            return Vec::new();
+        }
+        if self.hedge_fired_this_tick {
             return Vec::new();
         }
         // 确定追买哪侧、量的上限。
@@ -316,6 +331,10 @@ impl Engine {
         };
 
         let step_budget = self.config.hedge_attack_pool * self.config.hedge_step_fraction;
+        // 对冲池剩余不够本步预算就停手。
+        if self.hedge_budget_remaining < step_budget {
+            return Vec::new();
+        }
         self.current_generation = self.current_generation.next();
         let commands: Vec<Command> = self
             .ladder
@@ -333,33 +352,19 @@ impl Engine {
             .collect();
         // 仅在实际产出对冲指令时计步（扑空 / 被风控拦截不消耗步数）。
         if !commands.is_empty() {
-            // TODO 这里 taker_steps 在重置后重新计数？合理吗？
             self.taker_steps += 1;
+            self.hedge_fired_this_tick = true;
         }
         commands
     }
 
-    /// 找出亏损侧（"瘸腿"）：哪边的条件 PnL 穿透了亏损线就追买哪边。
-    /// 两边都穿了就追更亏的那边。
+    /// 找出亏损侧（"瘸腿"）：复用 PositionSnapshot::breached_side，
+    /// 和 fsm 的对冲触发判定共用同一套逻辑。
     fn lame_side(&self) -> Option<Side> {
-        let position = self.ledger.snapshot();
-        let trigger = self.state_machine.thresholds().hedge_loss_trigger;
-        let up_pnl = position.up_win_pnl();
-        let down_pnl = position.down_win_pnl();
-        // TODO 这里缺少数量的判断？
-        // TODO 这里和 fsm 里的逻辑重复？
-        let up_breached = up_pnl <= -trigger;
-        let down_breached = down_pnl <= -trigger;
-        match (up_breached, down_breached) {
-            (true, true) => Some(if up_pnl <= down_pnl {
-                Side::Up
-            } else {
-                Side::Down
-            }),
-            (true, false) => Some(Side::Up),
-            (false, true) => Some(Side::Down),
-            (false, false) => None,
-        }
+        let thresholds = self.state_machine.thresholds();
+        self.ledger
+            .snapshot()
+            .breached_side(thresholds.hedge_loss_trigger, thresholds.hedge_min_qty)
     }
 
     /// 找优势方：Up 侧 Mark Price > 0.5 说明市场看好 Up，就追买 Up；否则追 Down。
@@ -723,9 +728,10 @@ mod tests {
         };
         engine.hedge_phase = HedgePhase::Ev;
         engine.taker_steps = 0;
-        // 连续推进 7 次：前 5 次（max_taker_steps=5）各产出一条 Taker，之后停手。
+        // 每个 tick 最多打一步，需要在步与步之间插入 BookUpdate 重置标记。
         let mut emitted = 0;
         for _ in 0..7 {
+            engine.hedge_fired_this_tick = false; // 模拟新 tick 到来
             if !engine.hedge_step().is_empty() {
                 emitted += 1;
             }
@@ -739,15 +745,15 @@ mod tests {
         let mut engine = engine();
         engine.handle_event(full_book(dec!(0.05), dec!(0.10), dec!(0.05), dec!(0.10)));
         engine.start();
-        // 两侧都建少量仓但总成本很高 → 双边皆穿透；Down 更亏（qty 更小）。
-        // Up 20 股、Down 10 股、总成本 100：up_win_pnl=-80、down_win_pnl=-90，均 ≤ -30。
+        // 两侧持仓满足 min_qty(100)，且总成本高 → 双边皆穿透亏损线。
+        // Up 60 股、Down 50 股、总成本 200：up_win_pnl=-140、down_win_pnl=-150，均 ≤ -30。
         engine.handle_event(ExchangeEvent::Filled(Fill {
             order_id: OrderId(0),
             side: Side::Up,
             direction: OrderDirection::Buy,
             price: dec!(0.10),
-            filled_qty: dec!(20),
-            cash: dec!(50),
+            filled_qty: dec!(60),
+            cash: dec!(100),
             generation: Generation(1),
         }));
         engine.handle_event(ExchangeEvent::Filled(Fill {
@@ -755,11 +761,11 @@ mod tests {
             side: Side::Down,
             direction: OrderDirection::Buy,
             price: dec!(0.10),
-            filled_qty: dec!(10),
-            cash: dec!(50),
+            filled_qty: dec!(50),
+            cash: dec!(100),
             generation: Generation(1),
         }));
-        // 瘸腿侧应取亏损更深的 Down。
+        // 瘸腿侧应取亏损更深的 Down（-150 < -140）。
         assert_eq!(engine.lame_side(), Some(Side::Down));
     }
 
@@ -805,5 +811,115 @@ mod tests {
         let commands = engine.hedge_step();
         assert!(commands.is_empty());
         assert_eq!(engine.taker_steps, 0);
+    }
+
+    #[test]
+    fn hedge_step_limited_to_one_per_tick() {
+        let mut engine = engine();
+        engine.market = MarketSnapshot {
+            up: BookTop {
+                best_bid: Some(dec!(0.58)),
+                best_ask: Some(dec!(0.62)),
+                last_trade: None,
+            },
+            down: BookTop::default(),
+        };
+        engine.hedge_phase = HedgePhase::Ev;
+        engine.taker_steps = 0;
+        // 第一步：产出 Taker。
+        let first = engine.hedge_step();
+        assert_eq!(first.len(), 1);
+        assert_eq!(engine.taker_steps, 1);
+        // 同一 tick 第二步：被标记拦截，不产指令。
+        let second = engine.hedge_step();
+        assert!(second.is_empty());
+        assert_eq!(engine.taker_steps, 1);
+    }
+
+    #[test]
+    fn hedge_step_resumes_after_book_update() {
+        let mut engine = engine();
+        let book = MarketSnapshot {
+            up: BookTop {
+                best_bid: Some(dec!(0.58)),
+                best_ask: Some(dec!(0.62)),
+                last_trade: None,
+            },
+            down: BookTop::default(),
+        };
+        engine.market = book;
+        engine.hedge_phase = HedgePhase::Ev;
+        engine.taker_steps = 0;
+        // 第一步成功。
+        assert_eq!(engine.hedge_step().len(), 1);
+        // 同 tick 被拦。
+        assert!(engine.hedge_step().is_empty());
+        // 模拟新 tick 到来（BookUpdate 会重置标记）。
+        engine.hedge_fired_this_tick = false;
+        // 下一步又能打了。
+        assert_eq!(engine.hedge_step().len(), 1);
+        assert_eq!(engine.taker_steps, 2);
+    }
+
+    #[test]
+    fn hedge_budget_blocks_when_exhausted() {
+        let mut engine = engine();
+        engine.market = MarketSnapshot {
+            up: BookTop {
+                best_bid: Some(dec!(0.58)),
+                best_ask: Some(dec!(0.62)),
+                last_trade: None,
+            },
+            down: BookTop::default(),
+        };
+        engine.hedge_phase = HedgePhase::Ev;
+        engine.taker_steps = 0;
+        // 对冲池剩余设为比单步预算（225×0.2=45）少 → 打不出去。
+        engine.hedge_budget_remaining = dec!(10);
+        let commands = engine.hedge_step();
+        assert!(commands.is_empty());
+        // 步数没增（没真的打出去）。
+        assert_eq!(engine.taker_steps, 0);
+    }
+
+    #[test]
+    fn hedge_budget_deducted_on_fill_in_hedging_phase() {
+        let mut engine = engine();
+        engine.handle_event(book_update(dec!(0.40)));
+        engine.start();
+        // 手动进入对冲阶段。
+        engine.hedge_phase = HedgePhase::Dynamic;
+        let initial_budget = engine.hedge_budget_remaining;
+        // 模拟一笔对冲阶段的成交，花费 20。
+        engine.handle_event(ExchangeEvent::Filled(Fill {
+            order_id: OrderId(99),
+            side: Side::Up,
+            direction: OrderDirection::Buy,
+            price: dec!(0.40),
+            filled_qty: dec!(48),
+            cash: dec!(20),
+            generation: Generation(1),
+        }));
+        // 对冲池剩余应减少 20。
+        assert_eq!(engine.hedge_budget_remaining, initial_budget - dec!(20));
+    }
+
+    #[test]
+    fn hedge_budget_not_deducted_in_normal_phase() {
+        let mut engine = engine();
+        engine.handle_event(book_update(dec!(0.40)));
+        engine.start();
+        // 常规做市阶段（非对冲），对冲池不扣。
+        let initial_budget = engine.hedge_budget_remaining;
+        engine.handle_event(ExchangeEvent::Filled(Fill {
+            order_id: OrderId(0),
+            side: Side::Up,
+            direction: OrderDirection::Buy,
+            price: dec!(0.39),
+            filled_qty: dec!(50),
+            cash: dec!(20),
+            generation: Generation(1),
+        }));
+        assert_eq!(engine.hedge_budget_remaining, initial_budget);
     }
 }
