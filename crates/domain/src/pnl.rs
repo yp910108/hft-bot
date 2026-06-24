@@ -21,6 +21,14 @@ pub struct PositionSnapshot {
 }
 
 impl PositionSnapshot {
+    /// 取指定侧的持仓股数。
+    pub fn qty(&self, side: Side) -> Qty {
+        match side {
+            Side::Up => self.up_qty,
+            Side::Down => self.down_qty,
+        }
+    }
+
     /// 若最终 Up 侧胜出的条件盈亏 = Up 股数 × 1 − 总成本。
     ///
     /// 每股胜出侧在交割时兑付 1 美元，故 Up 胜出时回收金额即为 `up_qty`。

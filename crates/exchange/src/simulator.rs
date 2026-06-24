@@ -59,7 +59,6 @@ impl Simulator {
             .map(|order| order.order_id)
             .collect();
 
-        // TODO 有 resting_orders 了为何还要有 pending 订单？
         for order_id in filled_ids {
             let order = self.resting_orders.remove(&order_id).expect("挂单必存在");
             // Maker 挂单以限价成交（保守口径下卖一已穿越限价）。

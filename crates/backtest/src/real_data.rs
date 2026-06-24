@@ -12,6 +12,7 @@ use domain::market::{BookTop, MarketSnapshot};
 use domain::types::{Price, Side};
 use rust_decimal::Decimal;
 use std::fs;
+use std::io::Error;
 use std::path::Path;
 use std::str::FromStr;
 
@@ -19,13 +20,13 @@ use std::str::FromStr;
 #[derive(Debug)]
 pub enum LoadError {
     /// 文件读取失败。
-    Io(std::io::Error),
+    Io(Error),
     /// CSV 内容无法解析为有效行情（无表头、无数据行、或缺结算基准价）。
     Malformed(String),
 }
 
-impl From<std::io::Error> for LoadError {
-    fn from(e: std::io::Error) -> Self {
+impl From<Error> for LoadError {
+    fn from(e: Error) -> Self {
         LoadError::Io(e)
     }
 }

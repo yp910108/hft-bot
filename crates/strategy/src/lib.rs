@@ -1,18 +1,19 @@
-//! 梯度接低策略：在便宜的一侧分层挂买单，成交后自动在对面挂配对单锁利润。
+//! 策略模块：梯度接低 + 对冲决策。
 //!
-//! 两件事：
-//! 1. **布阵**（[`GradientLadder::deploy`]）：挑 best_ask < 0.5 的一侧，向下铺三档 Maker 买单。
-//! 2. **配对重算**（[`GradientLadder::recompute_after_fill`]）：本边买单成交后，
-//!    在更低价续挂追低，同时撤对面旧单、按新均价算出对面配对价重新挂。
-//!    配对价低于对面 Ask 就直接挂，否则先挂起（[`PendingOrder`]），等价格跌下来再补。
+//! 两大块：
+//! 1. **做市**：在便宜侧分层挂买单，成交后自动在对面挂配对单锁利润。
+//! 2. **对冲决策**：判断该追买哪侧、量的上限，供 engine 执行。
 //!
-//! 纯逻辑模块：吃行情和持仓，吐 [`Command`] 列表，不碰交易所。
+//! 纯逻辑模块：吃行情和持仓，吐 [`Command`] 列表或 [`HedgeDecision`]，不碰交易所。
 
 use domain::market::MarketSnapshot;
 use domain::order::{
     Command, Generation, Order, OrderConstraints, OrderDirection, OrderIdGenerator,
 };
+use domain::pnl::PositionSnapshot;
+use domain::state::RobotState;
 use domain::types::{Money, OrderRole, Price, Qty, Side};
+use fsm::Thresholds;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
@@ -196,18 +197,13 @@ impl GradientLadder {
         budget / price
     }
 
-    /// 跨侧配对重算：本边一笔 Maker 买单成交后触发。
+    /// 跨侧配对重算：本边 Maker 买单成交后触发。
     ///
-    /// 三个动作：
-    /// 1. **本边续挂追低**：在成交价下方 `follow_offset` 处再挂一档 Maker 买单，继续拉低本边均价。
-    /// 2. **撤对面**：撤销对面当前全部活跃挂单（[`Command::CancelSide`]）。
-    /// 3. **重算对面配对价**：配对价 = `1 - 本边最新均价 - min_profit_margin`。配对量采用
-    ///    **目标摽齐**：对面目标持仓 = 本边持仓，只补齐差额（`own_qty - opposite_qty`），
-    ///    差额 ≤ 0 则不下单。使双边持仓趋于相等、`min(Q_up,Q_down)` 最大化且无浪费敞口，
-    ///    并从根本上避免「配对买入又触发新配对」的仓位滚雪球。
-    ///    配对价 < 对面当前 Ask 则直接挂 Maker；否则作为 [`PendingOrder`] 挂起延迟补挂。
-    ///
-    /// 价格与股数均按交易所精度向下量化、并经最小量约束校验；不达标的挂单跳过。
+    /// 做三件事：
+    /// 1. 本边续挂追低：在成交价下方再挂一档，继续拉低均价。
+    /// 2. 撤对面所有旧挂单。
+    /// 3. 重算对面配对价（= 1 - 本边均价 - 利润空间），只补到跟本边持仓一样多（防滚雪球）。
+    ///    配对价 < 对面 Ask 就直接挂，否则存到 PendingOrder 等价格到位再补。
     pub fn recompute_after_fill(
         &self,
         fill: &FillContext,
@@ -280,18 +276,11 @@ impl GradientLadder {
         RecomputeResult { commands, pending }
     }
 
-    /// 对冲单步：产出一条 Taker 主动买单，用于动态对冲 / EV 对冲阶段。
+    /// 对冲单步：产出一条 Taker 买单。
     ///
-    /// 对应策略说明书第五、六节。一个函数覆盖两态，差异仅在 `cap`：
-    /// - **动态对冲**（追买瘸腿侧补到与对面摽齐）：`cap = Some(摽齐缺口)`，单步量为
-    ///   `min(预算可买量, 缺口)`；缺口 ≤ 0 表示已摽齐，返回空。
-    /// - **EV 对冲**（增厚优势方逼正 EV）：`cap = None`，单步量纯由预算封顶。
-    ///
-    /// 以该侧当前 `best_ask` 作为 Taker 成交价（卖一缺失则返回空，无从吃单）；价格与股数
-    /// 按交易所精度向下量化，并经最小量约束校验，不达标则跳过（同布阵 / 重算的资金纪律）。
-    /// 至多产出一条指令，由上层（engine）负责计步与上限控制。
-    // 参数虽多但各自语义独立（追买侧 / 上限 / 行情 / 预算 / 约束 / 下单上下文），
-    // 与同模块的 deploy / recompute_after_fill 风格一致，不强行打包成上下文结构体。
+    /// 动态对冲传 `cap = Some(摽齐缺口)`，EV 对冲传 `cap = None`。
+    /// 以该侧 best_ask 为成交价，缺卖一就不打。
+    /// 至多产出一条指令，计步和限频由 engine 管。
     #[allow(clippy::too_many_arguments)]
     pub fn hedge_taker_step(
         &self,
@@ -335,6 +324,95 @@ impl GradientLadder {
             role: OrderRole::Taker,
             generation,
         })]
+    }
+}
+
+/// 对冲阶段的粗分类。
+///
+/// 为什么不直接用 RobotState？因为 DynamicHedging 内部的 double_negative_count 自增
+/// 也会让状态变体变化，但那不算"切换了对冲阶段"。这里只关心三种情况：
+/// 没在对冲 / 在动态对冲 / 在 EV 对冲。只有这三种之间切换时才重置 Taker 步数。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HedgePhase {
+    /// 不在对冲（常规做市、初始化、已收手等）。
+    None,
+    /// 动态对冲：追买亏损侧，补到跟对面持仓一样多。
+    Dynamic,
+    /// EV 对冲：追买胜率高的一侧，把数学期望逼到非负。
+    Ev,
+}
+
+impl HedgePhase {
+    /// 把状态机状态映射到对冲阶段分类。
+    pub fn of(state: RobotState) -> Self {
+        match state {
+            RobotState::DynamicHedging { .. } => HedgePhase::Dynamic,
+            RobotState::EvHedging => HedgePhase::Ev,
+            _ => HedgePhase::None,
+        }
+    }
+
+    /// 当前是否在对冲中（Dynamic 或 Ev）。
+    pub fn is_hedging(self) -> bool {
+        matches!(self, HedgePhase::Dynamic | HedgePhase::Ev)
+    }
+}
+
+/// 对冲单步的决策结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HedgeDecision {
+    /// 不执行（没找到追买侧 / 缺口已补齐 / 盘口缺失）。
+    Skip,
+    /// 执行：追买指定侧，带量上限。
+    Execute { side: Side, cap: Option<Qty> },
+}
+
+impl GradientLadder {
+    /// 决定对冲该追买哪侧、量的上限。纯决策，不产出订单。
+    ///
+    /// - Dynamic 阶段：找瘸腿侧，cap = 对面持仓 - 本侧持仓（补到摽齐）。
+    /// - Ev 阶段：找优势方（mark_price > 0.5 的那侧），cap = None（纯靠预算封顶）。
+    /// - None 阶段：返回 Skip。
+    pub fn decide_hedge_step(
+        &self,
+        phase: HedgePhase,
+        position: &PositionSnapshot,
+        market: &MarketSnapshot,
+        thresholds: &Thresholds,
+    ) -> HedgeDecision {
+        match phase {
+            HedgePhase::Dynamic => {
+                let Some(side) =
+                    position.breached_side(thresholds.hedge_loss_trigger, thresholds.hedge_min_qty)
+                else {
+                    return HedgeDecision::Skip;
+                };
+                let gap = position.qty(side.opposite()) - position.qty(side);
+                HedgeDecision::Execute {
+                    side,
+                    cap: Some(gap),
+                }
+            }
+            HedgePhase::Ev => {
+                let Some(side) = Self::advantaged_side(market) else {
+                    return HedgeDecision::Skip;
+                };
+                HedgeDecision::Execute { side, cap: None }
+            }
+            HedgePhase::None => HedgeDecision::Skip,
+        }
+    }
+
+    /// 找优势方：Up 侧 Mark Price > 0.5 说明市场看好 Up，就追买 Up；否则追 Down。
+    /// 盘口缺失时返回 None。
+    fn advantaged_side(market: &MarketSnapshot) -> Option<Side> {
+        market.mark_price(Side::Up).map(|up_probability| {
+            if up_probability > dec!(0.5) {
+                Side::Up
+            } else {
+                Side::Down
+            }
+        })
     }
 }
 
@@ -819,5 +897,121 @@ mod tests {
             Generation::new(),
         );
         assert!(commands.is_empty());
+    }
+
+    fn thresholds() -> Thresholds {
+        Thresholds {
+            hedge_loss_trigger: dec!(30),
+            hedge_min_qty: dec!(100),
+            profit_target: dec!(15),
+        }
+    }
+
+    fn position(up_qty: Qty, down_qty: Qty, total_cost: Money) -> PositionSnapshot {
+        PositionSnapshot {
+            up_qty,
+            down_qty,
+            total_cost,
+        }
+    }
+
+    fn market_with_mid(up_bid: Price, up_ask: Price) -> MarketSnapshot {
+        MarketSnapshot {
+            up: BookTop {
+                best_bid: Some(up_bid),
+                best_ask: Some(up_ask),
+                last_trade: None,
+            },
+            down: BookTop::default(),
+        }
+    }
+
+    #[test]
+    fn decide_hedge_dynamic_finds_lame_side() {
+        let ladder = GradientLadder::with_default_config();
+        // Up 20 股、Down 100 股、总成本 80 → up_pnl = 20-80 = -60 ≤ -30，穿线。
+        // 总持仓 120 ≥ min_qty 100。瘸腿侧 = Up，cap = 100 - 20 = 80。
+        let pos = position(dec!(20), dec!(100), dec!(80));
+        let decision = ladder.decide_hedge_step(
+            HedgePhase::Dynamic,
+            &pos,
+            &market(Some(dec!(0.40)), Some(dec!(0.60))),
+            &thresholds(),
+        );
+        assert!(matches!(
+            decision,
+            HedgeDecision::Execute { side: Side::Up, cap: Some(gap) } if gap == dec!(80)
+        ));
+    }
+
+    #[test]
+    fn decide_hedge_dynamic_skips_when_qty_insufficient() {
+        let ladder = GradientLadder::with_default_config();
+        // 总持仓 30 < min_qty 100 → 不触发，即使 PnL 穿线。
+        let pos = position(dec!(10), dec!(20), dec!(80));
+        let decision = ladder.decide_hedge_step(
+            HedgePhase::Dynamic,
+            &pos,
+            &market(Some(dec!(0.40)), Some(dec!(0.60))),
+            &thresholds(),
+        );
+        assert_eq!(decision, HedgeDecision::Skip);
+    }
+
+    #[test]
+    fn decide_hedge_ev_finds_advantaged_side() {
+        let ladder = GradientLadder::with_default_config();
+        let pos = position(dec!(100), dec!(100), dec!(200));
+        // Up mark = (0.58+0.62)/2 = 0.60 > 0.5 → 优势 Up。
+        let decision = ladder.decide_hedge_step(
+            HedgePhase::Ev,
+            &pos,
+            &market_with_mid(dec!(0.58), dec!(0.62)),
+            &thresholds(),
+        );
+        assert!(matches!(
+            decision,
+            HedgeDecision::Execute {
+                side: Side::Up,
+                cap: None
+            }
+        ));
+        // Up mark = (0.28+0.32)/2 = 0.30 < 0.5 → 优势 Down。
+        let decision = ladder.decide_hedge_step(
+            HedgePhase::Ev,
+            &pos,
+            &market_with_mid(dec!(0.28), dec!(0.32)),
+            &thresholds(),
+        );
+        assert!(matches!(
+            decision,
+            HedgeDecision::Execute {
+                side: Side::Down,
+                cap: None
+            }
+        ));
+    }
+
+    #[test]
+    fn decide_hedge_ev_skips_when_no_market() {
+        let ladder = GradientLadder::with_default_config();
+        let pos = position(dec!(100), dec!(100), dec!(200));
+        // 盘口全空 → 算不出 mark price → Skip。
+        let empty_market = MarketSnapshot::default();
+        let decision = ladder.decide_hedge_step(HedgePhase::Ev, &pos, &empty_market, &thresholds());
+        assert_eq!(decision, HedgeDecision::Skip);
+    }
+
+    #[test]
+    fn decide_hedge_none_always_skips() {
+        let ladder = GradientLadder::with_default_config();
+        let pos = position(dec!(100), dec!(100), dec!(200));
+        let decision = ladder.decide_hedge_step(
+            HedgePhase::None,
+            &pos,
+            &market(Some(dec!(0.40)), Some(dec!(0.60))),
+            &thresholds(),
+        );
+        assert_eq!(decision, HedgeDecision::Skip);
     }
 }

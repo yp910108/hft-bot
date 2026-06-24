@@ -3,6 +3,7 @@
 //!
 //! 运行：`cargo run -p backtest --example report_json --release`
 
+use backtest::market::Market;
 use backtest::real_data;
 use domain::fee::FeeModel;
 use domain::order::{Command, OrderConstraints};
@@ -16,9 +17,9 @@ use risk::auditor::RiskAuditor;
 use risk::pool::CapitalPools;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use strategy::GradientLadder;
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -90,13 +91,13 @@ fn side_cost(engine: &Engine, side: Side) -> f64 {
 
 /// 跑一场回测,记录逐笔成交,返回 JSON Value。
 fn run_with_log(
-    market: &backtest::market::Market,
+    market: &Market,
     title: String,
     condition_id: String,
     base_time: &str,
     total_capital: Decimal,
     fee_model: FeeModel,
-) -> serde_json::Value {
+) -> Value {
     let (pools, thresholds, config) = make_config(total_capital);
     let mut engine = Engine::new(
         total_capital,
@@ -165,7 +166,7 @@ fn run_with_log(
         pnl_if_dn
     };
 
-    let ops_json: Vec<serde_json::Value> = ops.iter().map(|op| op.to_json()).collect();
+    let ops_json: Vec<Value> = ops.iter().map(|op| op.to_json()).collect();
 
     json!({
         "condition_id": condition_id,
@@ -280,7 +281,7 @@ fn main() {
 
     // 遍历 logs/ 全部日期目录。
     let logs_dir = Path::new("logs");
-    let mut all_files: Vec<std::path::PathBuf> = Vec::new();
+    let mut all_files: Vec<PathBuf> = Vec::new();
     if let Ok(dates) = fs::read_dir(logs_dir) {
         let mut date_dirs: Vec<_> = dates
             .filter_map(Result::ok)
@@ -303,7 +304,7 @@ fn main() {
 
     println!("找到 {} 个 CSV 文件", all_files.len());
 
-    let mut records: Vec<serde_json::Value> = Vec::new();
+    let mut records: Vec<Value> = Vec::new();
     let mut errors = 0usize;
 
     for (i, path) in all_files.iter().enumerate() {
