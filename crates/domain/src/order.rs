@@ -109,6 +109,8 @@ pub struct Fill {
     pub side: Side,
     /// 买入或卖出。
     pub direction: OrderDirection,
+    /// 订单角色（Maker 被动撮合 / Taker 主动吃单）。
+    pub role: OrderRole,
     /// 实际成交价（每股价格），EV 模块据此映射胜出概率。
     pub price: Price,
     /// 扣除手续费后实际入仓的净股数。

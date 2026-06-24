@@ -77,7 +77,7 @@ impl Wal {
 mod tests {
     use super::*;
     use domain::order::{Generation, OrderDirection, OrderId};
-    use domain::types::Side;
+    use domain::types::{Money, OrderRole, Price, Qty, Side};
     use rust_decimal_macros::dec;
     use std::env;
     use std::fs;
@@ -93,16 +93,12 @@ mod tests {
     }
 
     /// 构造一笔成交回报。
-    fn fill(
-        side: Side,
-        price: domain::types::Price,
-        filled_qty: domain::types::Qty,
-        cash: domain::types::Money,
-    ) -> Fill {
+    fn fill(side: Side, price: Price, filled_qty: Qty, cash: Money) -> Fill {
         Fill {
             order_id: OrderId(0),
             side,
             direction: OrderDirection::Buy,
+            role: OrderRole::Maker,
             price,
             filled_qty,
             cash,

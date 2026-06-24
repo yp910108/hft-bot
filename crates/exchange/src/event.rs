@@ -40,7 +40,7 @@ pub enum ExchangeEvent {
 mod tests {
     use super::*;
     use domain::order::{Generation, OrderDirection};
-    use domain::types::Side;
+    use domain::types::{OrderRole, Side};
     use rust_decimal_macros::dec;
 
     #[test]
@@ -49,6 +49,7 @@ mod tests {
             order_id: OrderId(7),
             side: Side::Up,
             direction: OrderDirection::Buy,
+            role: OrderRole::Maker,
             price: dec!(0.4),
             filled_qty: dec!(100),
             cash: dec!(40),

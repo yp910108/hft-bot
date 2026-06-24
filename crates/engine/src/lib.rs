@@ -355,7 +355,7 @@ mod tests {
     use domain::market::BookTop;
     use domain::order::{Fill, OrderDirection, OrderId};
     use domain::state::RobotState;
-    use domain::types::Side;
+    use domain::types::{OrderRole, Side};
     use risk::pool::CapitalPools;
     use rust_decimal_macros::dec;
 
@@ -442,6 +442,7 @@ mod tests {
             order_id: OrderId(0),
             side: Side::Up,
             direction: OrderDirection::Buy,
+            role: OrderRole::Maker,
             price: dec!(0.39),
             filled_qty: dec!(50),
             cash: dec!(20),
@@ -463,6 +464,7 @@ mod tests {
             order_id: OrderId(99),
             side: Side::Up,
             direction: OrderDirection::Buy,
+            role: OrderRole::Maker,
             price: dec!(0.39),
             filled_qty: dec!(50),
             cash: dec!(20),
@@ -496,6 +498,7 @@ mod tests {
             order_id: OrderId(0),
             side,
             direction: OrderDirection::Buy,
+            role: OrderRole::Maker,
             price,
             filled_qty: qty,
             cash,
@@ -551,6 +554,7 @@ mod tests {
             order_id: OrderId(0),
             side: Side::Up,
             direction: OrderDirection::Buy,
+            role: OrderRole::Maker,
             price: dec!(0.40),
             filled_qty: dec!(100),
             cash: dec!(40),
@@ -560,6 +564,7 @@ mod tests {
             order_id: OrderId(1),
             side: Side::Down,
             direction: OrderDirection::Buy,
+            role: OrderRole::Maker,
             price: dec!(0.40),
             filled_qty: dec!(100),
             cash: dec!(40),
@@ -576,6 +581,7 @@ mod tests {
             order_id: OrderId(2),
             side: Side::Up,
             direction: OrderDirection::Buy,
+            role: OrderRole::Maker,
             price: dec!(0.30),
             filled_qty: dec!(50),
             cash: dec!(15),
@@ -613,6 +619,7 @@ mod tests {
             order_id: OrderId(0),
             side: Side::Down,
             direction: OrderDirection::Buy,
+            role: OrderRole::Maker,
             price: dec!(0.60),
             filled_qty: dec!(100),
             cash: dec!(60),
@@ -643,6 +650,7 @@ mod tests {
             order_id: OrderId(0),
             side: Side::Down,
             direction: OrderDirection::Buy,
+            role: OrderRole::Maker,
             price: dec!(0.60),
             filled_qty: dec!(100),
             cash: dec!(60),
@@ -783,6 +791,7 @@ mod tests {
             order_id: OrderId(99),
             side: Side::Up,
             direction: OrderDirection::Buy,
+            role: OrderRole::Maker,
             price: dec!(0.40),
             filled_qty: dec!(48),
             cash: dec!(20),
@@ -803,6 +812,7 @@ mod tests {
             order_id: OrderId(0),
             side: Side::Up,
             direction: OrderDirection::Buy,
+            role: OrderRole::Maker,
             price: dec!(0.39),
             filled_qty: dec!(50),
             cash: dec!(20),

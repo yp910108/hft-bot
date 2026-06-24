@@ -151,8 +151,17 @@ def _build_rows(ops):
             tip = f'卖{op.get("orig_dir")}@{op.get("orig_price"):.4f} → 买{d}@{p:.4f}'
             dir_h = f'<b>{d}</b> <span class="conv" title="{tip}">⇄</span>'
         else:
-            dir_h = f'<b>{d}</b>'
+            dir_color = "#66bb6a" if d == "UP" else "#ef5350"
+            dir_h = f'<b style="color:{dir_color}">{d}</b>'
+        role = op.get('role', '')
+        if role == "Taker":
+            role_h = '<span style="background:#e65100;color:#fff;padding:1px 5px;border-radius:3px;font-size:10px">Taker</span>'
+        elif role == "Maker":
+            role_h = '<span style="background:#1565c0;color:#fff;padding:1px 5px;border-radius:3px;font-size:10px">Maker</span>'
+        else:
+            role_h = role
         rows.append(f"<tr{row_style}><td>{j+1}</td><td>{t}</td><td>{dir_h}</td>"
+                    f"<td>{role_h}</td>"
                     f"<td>{p:.4f}</td><td>{s:.1f}</td>"
                     f"<td>{cuq:.1f}</td><td>{cuc:.2f}</td><td>{ua:.4f}</td>"
                     f"<td>{cdq:.1f}</td><td>{cdc:.2f}</td><td>{da:.4f}</td>"
@@ -207,7 +216,7 @@ def render_market(m, idx, total):
 ⇄ 标记行 = 卖出已等价转换为买入对边(卖S@p ≡ 买¬S@1-p)，悬停查看原始卖出；无标记行为原始买入。
 </div>
 <table>
-<tr><th>#</th><th>时间</th><th>方向</th><th>价格</th><th>数量</th>
+<tr><th>#</th><th>时间</th><th>方向</th><th>角色</th><th>价格</th><th>数量</th>
 <th>UP持仓</th><th>UP成本</th><th>UP均价</th><th>DN持仓</th><th>DN成本</th><th>DN均价</th>
 <th>总成本</th><th>UP赢PnL</th><th>DN赢PnL</th><th>PnL差</th><th>换向</th><th>动作</th></tr>
 {"".join(rows)}

@@ -27,6 +27,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 struct OpRecord {
     time: String,
     direction: &'static str,
+    role: &'static str,
     price: f64,
     size: f64,
     up_qty: f64,
@@ -43,6 +44,7 @@ impl OpRecord {
         json!({
             "time": self.time,
             "direction": self.direction,
+            "role": self.role,
             "side": "BUY",
             "price": self.price,
             "size": self.size,
@@ -204,6 +206,10 @@ fn drain_and_record(
                 Side::Up => "UP",
                 Side::Down => "DN",
             };
+            let role = match fill.role {
+                domain::types::OrderRole::Maker => "Maker",
+                domain::types::OrderRole::Taker => "Taker",
+            };
             let price = decimal_to_f64(fill.price);
             // size 用 gross qty(= cash / price),即原始下单股数(扣费前),
             // 因为 _build_rows 会自己用 price×size 算 cost。
@@ -245,6 +251,7 @@ fn drain_and_record(
             ops.push(OpRecord {
                 time,
                 direction,
+                role,
                 price,
                 size: gross_size,
                 up_qty,

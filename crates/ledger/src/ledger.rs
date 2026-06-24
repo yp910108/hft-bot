@@ -120,6 +120,7 @@ impl Ledger {
 mod tests {
     use super::*;
     use domain::order::{Generation, OrderId};
+    use domain::types::OrderRole;
     use rust_decimal_macros::dec;
 
     /// 构造一笔成交回报的测试辅助函数。
@@ -136,6 +137,7 @@ mod tests {
             order_id: OrderId(0),
             side,
             direction,
+            role: OrderRole::Maker,
             price,
             filled_qty,
             cash,

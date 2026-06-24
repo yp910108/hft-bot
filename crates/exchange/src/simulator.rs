@@ -114,6 +114,7 @@ impl Simulator {
             order_id: order.order_id,
             side: order.side,
             direction: order.direction,
+            role: order.role,
             price: exec_price,
             filled_qty,
             cash,
