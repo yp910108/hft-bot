@@ -1,23 +1,28 @@
-//! 条件盈亏（Conditional PnL）与数学期望（EV）计算。
+//! 盈亏口径：结算盈亏、浮亏、数学期望。纯函数无 IO。
 //!
-//! 系统所有状态切换与执行决策的底层数据源，纯函数无 IO。
+//! 两个独立口径，抓两件不同的事（见策略说明书第三节）：
+//! - **结算 pnl**：该侧若赢能拿回多少 = 该侧股数 − 双边总成本。二元市场胜方每股值 1。
+//! - **浮亏 pnl**：该侧现在按 best_bid 强平能拿回多少 = 该侧股数 × bid − 该侧成本。
+//!   逐侧算、只对有持仓的侧算、用 bid（最坏情况），是趋势盘的底线防守信号。
 //!
-//! 判定「双向盈利」一律以真实盈亏公式 `min(Q_up, Q_down) > C_total` 为准，
-//! 不使用「双边均价之和 < 1」这一仅在两边股数相等时才等价的近似。
+//! 阈值（利润锁定线、亏损触发线等都相对总资金 V）的比较放在 strategy 层，
+//! 本模块只产出原始盈亏数值，不含任何阈值。
 
-use crate::types::{Money, Qty, Side};
+use crate::types::{Money, Price, Qty, Side};
 
-/// 某一时点的持仓快照，用于计算条件盈亏与数学期望。
+/// 某一时点的持仓快照。按侧分别记录股数与成本，便于算逐侧浮亏。
 ///
-/// `total_cost` 是双边累计投入的净总成本，已包含所有已发生的手续费。
+/// 成本是该侧累计投入的净现金（含已发生手续费）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PositionSnapshot {
-    /// 持有的 Up 侧股数。
+    /// Up 侧净入仓股数。
     pub up_qty: Qty,
-    /// 持有的 Down 侧股数。
+    /// Down 侧净入仓股数。
     pub down_qty: Qty,
-    /// 双边累计净总成本（含手续费）。
-    pub total_cost: Money,
+    /// Up 侧累计投入成本（含费）。
+    pub up_cost: Money,
+    /// Down 侧累计投入成本（含费）。
+    pub down_cost: Money,
 }
 
 impl PositionSnapshot {
@@ -29,49 +34,62 @@ impl PositionSnapshot {
         }
     }
 
-    /// 若最终 Up 侧胜出的条件盈亏 = Up 股数 × 1 − 总成本。
-    ///
-    /// 每股胜出侧在交割时兑付 1 美元，故 Up 胜出时回收金额即为 `up_qty`。
-    pub fn up_win_pnl(&self) -> Money {
-        self.up_qty - self.total_cost
+    /// 取指定侧的投入成本。
+    pub fn cost(&self, side: Side) -> Money {
+        match side {
+            Side::Up => self.up_cost,
+            Side::Down => self.down_cost,
+        }
     }
 
-    /// 若最终 Down 侧胜出的条件盈亏 = Down 股数 × 1 − 总成本。
-    pub fn down_win_pnl(&self) -> Money {
-        self.down_qty - self.total_cost
+    /// 双边总成本 = 两侧成本之和。结算 pnl 的减数。
+    pub fn total_cost(&self) -> Money {
+        self.up_cost + self.down_cost
     }
 
-    /// 是否已锁定双向利润：无论哪一侧胜出，条件盈亏均严格为正。
-    ///
-    /// 等价于真实条件 `min(up_qty, down_qty) > total_cost`。
-    pub fn is_profit_locked(&self) -> bool {
-        self.up_win_pnl() > Money::ZERO && self.down_win_pnl() > Money::ZERO
+    /// 指定侧的成交均价 = 该侧成本 ÷ 该侧股数。无持仓返回 None。
+    pub fn average_price(&self, side: Side) -> Option<Price> {
+        let qty = self.qty(side);
+        if qty > Qty::ZERO {
+            Some(self.cost(side) / qty)
+        } else {
+            None
+        }
     }
 
-    /// 是否两边条件 PnL 同时为负：无论哪一侧胜出均亏损。
+    /// 结算 pnl：该侧若赢能拿回多少 = 该侧股数 − 双边总成本。
     ///
-    /// 与 [`Self::is_profit_locked`] 对称，用于对冲阶段判定双边瘸腿恶化。
-    pub fn both_sides_negative(&self) -> bool {
-        self.up_win_pnl() < Money::ZERO && self.down_win_pnl() < Money::ZERO
+    /// 胜方每股交割兑付 1 美元，故 Up 赢时回收金额即 up_qty。
+    pub fn settle_pnl(&self, side: Side) -> Money {
+        self.qty(side) - self.total_cost()
     }
 
-    /// 计算交割数学期望（EV）。
+    /// 浮亏 pnl：该侧现在按 best_bid 强平能拿回多少 = 该侧股数 × bid − 该侧成本。
     ///
-    /// `up_win_probability` 为 Up 侧最终胜出的概率 p（取值 [0, 1]），
-    /// Down 侧胜出概率为 q = 1 − p：
-    ///
-    /// `EV = p × up_win_pnl + (1 − p) × down_win_pnl`
-    pub fn expected_value(&self, up_win_probability: Money) -> Money {
-        let q = Money::ONE - up_win_probability;
-        up_win_probability * self.up_win_pnl() + q * self.down_win_pnl()
+    /// 用本侧成本、用 bid（现在立即割肉的最坏价）。只对有持仓的侧有意义，
+    /// 无持仓返回 None（没仓位谈不上浮亏）。
+    pub fn float_pnl(&self, side: Side, best_bid: Price) -> Option<Money> {
+        let qty = self.qty(side);
+        if qty > Qty::ZERO {
+            Some(qty * best_bid - self.cost(side))
+        } else {
+            None
+        }
     }
 
-    /// 找 PnL 更小的一侧（瘸腿侧）。两侧相等返回 None。
+    /// 两侧结算 pnl 是否同时为负：无论哪侧赢都亏。
     ///
-    /// 用于 PnL 驱动的对冲决策：不看穿不穿线，只看哪边更弱就追买哪边。
+    /// EV 升级计数器的判定依据（双边同时亏说明 sum_avg > 1 且两侧高位套牢）。
+    pub fn both_sides_settle_negative(&self) -> bool {
+        self.settle_pnl(Side::Up) < Money::ZERO && self.settle_pnl(Side::Down) < Money::ZERO
+    }
+
+    /// 结算 pnl 更小（亏损更大）的一侧。两侧相等返回 None。
+    ///
+    /// 动态对冲补「亏损大侧」摊薄均价时用它选边。
     pub fn weaker_side(&self) -> Option<Side> {
-        let up = self.up_win_pnl();
-        let down = self.down_win_pnl();
+        let up = self.settle_pnl(Side::Up);
+        let down = self.settle_pnl(Side::Down);
         if up < down {
             Some(Side::Up)
         } else if down < up {
@@ -81,26 +99,24 @@ impl PositionSnapshot {
         }
     }
 
-    /// 找出穿透亏损线的一侧（"瘸腿侧"）。
+    /// 未配对保护成本 = max(0, 主战场侧股数 − 对面股数) × 主战场侧均价。
     ///
-    /// 条件：总持仓 ≥ min_qty（防开局噪音）且某边 PnL ≤ -loss_trigger。
-    /// 双侧都穿取更亏的那边。都没穿或持仓不够返回 None。
-    pub fn breached_side(&self, loss_trigger: Money, min_qty: Qty) -> Option<Side> {
-        if self.up_qty + self.down_qty < min_qty {
-            return None;
+    /// 度量主战场侧比对面多出来、没被配对保护的裸露头寸现价值，用于最大敞口判定。
+    /// 主战场侧无持仓时无裸露，返回 0。
+    pub fn unpaired_cost(&self, main_side: Side) -> Money {
+        let gap = self.qty(main_side) - self.qty(main_side.opposite());
+        match self.average_price(main_side) {
+            Some(avg) if gap > Qty::ZERO => gap * avg,
+            _ => Money::ZERO,
         }
-        let up_breached = self.up_win_pnl() <= -loss_trigger;
-        let down_breached = self.down_win_pnl() <= -loss_trigger;
-        match (up_breached, down_breached) {
-            (true, true) => Some(if self.up_win_pnl() <= self.down_win_pnl() {
-                Side::Up
-            } else {
-                Side::Down
-            }),
-            (true, false) => Some(Side::Up),
-            (false, true) => Some(Side::Down),
-            _ => None,
-        }
+    }
+
+    /// 交割数学期望 EV = p × Up结算pnl + (1−p) × Down结算pnl。
+    ///
+    /// `up_win_probability` 为 Up 胜出概率 p（取 Up 侧 Mark Price 近似）。
+    pub fn expected_value(&self, up_win_probability: Money) -> Money {
+        let q = Money::ONE - up_win_probability;
+        up_win_probability * self.settle_pnl(Side::Up) + q * self.settle_pnl(Side::Down)
     }
 }
 
@@ -109,165 +125,95 @@ mod tests {
     use super::*;
     use rust_decimal_macros::dec;
 
-    #[test]
-    fn up_and_down_win_pnl_are_qty_minus_cost() {
-        let pos = PositionSnapshot {
-            up_qty: dec!(100),
-            down_qty: dec!(80),
-            total_cost: dec!(90),
-        };
-        assert_eq!(pos.up_win_pnl(), dec!(10));
-        assert_eq!(pos.down_win_pnl(), dec!(-10));
+    fn pos(up_qty: Qty, down_qty: Qty, up_cost: Money, down_cost: Money) -> PositionSnapshot {
+        PositionSnapshot {
+            up_qty,
+            down_qty,
+            up_cost,
+            down_cost,
+        }
     }
 
     #[test]
-    fn profit_is_locked_only_when_both_sides_positive() {
-        // 两边股数均高于总成本 → 双向锁定利润。
-        let locked = PositionSnapshot {
-            up_qty: dec!(100),
-            down_qty: dec!(95),
-            total_cost: dec!(90),
-        };
-        assert!(locked.is_profit_locked());
-
-        // 仅 Up 侧为正、Down 侧为负 → 未锁定。
-        let one_sided = PositionSnapshot {
-            up_qty: dec!(100),
-            down_qty: dec!(80),
-            total_cost: dec!(90),
-        };
-        assert!(!one_sided.is_profit_locked());
+    fn settle_pnl_is_qty_minus_total_cost() {
+        // 总成本 = 40 + 50 = 90。Up 赢拿回 100 → +10；Down 赢拿回 80 → −10。
+        let p = pos(dec!(100), dec!(80), dec!(40), dec!(50));
+        assert_eq!(p.total_cost(), dec!(90));
+        assert_eq!(p.settle_pnl(Side::Up), dec!(10));
+        assert_eq!(p.settle_pnl(Side::Down), dec!(-10));
     }
 
     #[test]
-    fn profit_not_locked_when_min_qty_equals_cost() {
-        // 边界：min(qty) 恰等于成本时，该侧 PnL 为 0，不算严格为正。
-        let pos = PositionSnapshot {
-            up_qty: dec!(90),
-            down_qty: dec!(90),
-            total_cost: dec!(90),
-        };
-        assert!(!pos.is_profit_locked());
+    fn float_pnl_uses_side_cost_and_bid() {
+        // Up 持仓 100、成本 45，bid 0.40 → 强平拿回 40 − 45 = −5。
+        let p = pos(dec!(100), dec!(0), dec!(45), dec!(0));
+        assert_eq!(p.float_pnl(Side::Up, dec!(0.40)), Some(dec!(-5.00)));
     }
 
     #[test]
-    fn both_sides_negative_only_when_both_pnl_below_zero() {
-        // 两边股数均低于成本 → 双边皆负。
-        let both_negative = PositionSnapshot {
-            up_qty: dec!(40),
-            down_qty: dec!(50),
-            total_cost: dec!(100),
-        };
-        assert!(both_negative.both_sides_negative());
-
-        // 仅一侧为负 → 不算双边皆负。
-        let one_sided = PositionSnapshot {
-            up_qty: dec!(120),
-            down_qty: dec!(80),
-            total_cost: dec!(100),
-        };
-        assert!(!one_sided.both_sides_negative());
+    fn float_pnl_none_when_no_position() {
+        // Down 侧空仓 → 无浮亏可言。
+        let p = pos(dec!(100), dec!(0), dec!(45), dec!(0));
+        assert_eq!(p.float_pnl(Side::Down, dec!(0.50)), None);
     }
 
     #[test]
-    fn both_sides_negative_false_when_pnl_equals_zero() {
-        // 边界：某侧 PnL 恰为 0 时不算严格为负。
-        let pos = PositionSnapshot {
-            up_qty: dec!(100),
-            down_qty: dec!(40),
-            total_cost: dec!(100),
-        };
-        // up_win_pnl = 0（非负），故不构成双边皆负。
-        assert!(!pos.both_sides_negative());
+    fn average_price_is_cost_over_qty() {
+        let p = pos(dec!(100), dec!(0), dec!(45), dec!(0));
+        assert_eq!(p.average_price(Side::Up), Some(dec!(0.45)));
+        assert_eq!(p.average_price(Side::Down), None);
+    }
+
+    #[test]
+    fn both_sides_settle_negative_only_when_both_below_zero() {
+        // 总成本 100，两侧股数 40/50 都 < 100 → 双负。
+        let both = pos(dec!(40), dec!(50), dec!(50), dec!(50));
+        assert!(both.both_sides_settle_negative());
+        // Up 120 > 100 → 不双负。
+        let one = pos(dec!(120), dec!(80), dec!(50), dec!(50));
+        assert!(!one.both_sides_settle_negative());
+    }
+
+    #[test]
+    fn both_sides_negative_false_when_one_pnl_zero() {
+        // 总成本 100，Up 恰 100 → settle pnl = 0，非严格负。
+        let p = pos(dec!(100), dec!(40), dec!(50), dec!(50));
+        assert!(!p.both_sides_settle_negative());
+    }
+
+    #[test]
+    fn weaker_side_picks_smaller_settle_pnl() {
+        // 总成本 80。Up 20 → −60，Down 100 → +20。Up 更弱。
+        let p = pos(dec!(20), dec!(100), dec!(40), dec!(40));
+        assert_eq!(p.weaker_side(), Some(Side::Up));
+    }
+
+    #[test]
+    fn weaker_side_none_when_equal() {
+        // 两侧股数相等 → 结算 pnl 相等。
+        let p = pos(dec!(50), dec!(50), dec!(40), dec!(40));
+        assert_eq!(p.weaker_side(), None);
+    }
+
+    #[test]
+    fn unpaired_cost_is_exposed_shares_times_avg() {
+        // Up 120、Down 80，主战场 Up，均价 = 60/120 = 0.5。
+        // 裸露 = 120 − 80 = 40 股 × 0.5 = 20。
+        let p = pos(dec!(120), dec!(80), dec!(60), dec!(40));
+        assert_eq!(p.unpaired_cost(Side::Up), dec!(20.0));
+    }
+
+    #[test]
+    fn unpaired_cost_zero_when_aligned_or_opposite_larger() {
+        // Up 80 < Down 120 → 主战场 Up 无裸露。
+        let p = pos(dec!(80), dec!(120), dec!(40), dec!(60));
+        assert_eq!(p.unpaired_cost(Side::Up), Money::ZERO);
     }
 
     #[test]
     fn expected_value_weighted_by_probability() {
-        let pos = PositionSnapshot {
-            up_qty: dec!(120),
-            down_qty: dec!(80),
-            total_cost: dec!(100),
-        };
-        // up_win_pnl = 20, down_win_pnl = -20。
-        // p = 0.6 → EV = 0.6×20 + 0.4×(−20) = 12 − 8 = 4。
-        assert_eq!(pos.expected_value(dec!(0.6)), dec!(4.0));
-    }
-
-    #[test]
-    fn expected_value_at_certain_outcomes() {
-        let pos = PositionSnapshot {
-            up_qty: dec!(120),
-            down_qty: dec!(80),
-            total_cost: dec!(100),
-        };
-        // p = 1 → EV 退化为 up_win_pnl；p = 0 → EV 退化为 down_win_pnl。
-        assert_eq!(pos.expected_value(dec!(1)), dec!(20));
-        assert_eq!(pos.expected_value(dec!(0)), dec!(-20));
-    }
-
-    #[test]
-    fn breached_side_returns_none_when_qty_insufficient() {
-        // 总持仓 30 < min_qty 100，即使 PnL 穿透也不触发。
-        let pos = PositionSnapshot {
-            up_qty: dec!(10),
-            down_qty: dec!(20),
-            total_cost: dec!(80),
-        };
-        assert!(pos.breached_side(dec!(30), dec!(100)).is_none());
-    }
-
-    #[test]
-    fn breached_side_returns_up_when_only_up_breached() {
-        // up_pnl = 20 - 80 = -60 ≤ -30, down_pnl = 80 - 80 = 0 > -30。
-        let pos = PositionSnapshot {
-            up_qty: dec!(20),
-            down_qty: dec!(80),
-            total_cost: dec!(80),
-        };
-        assert_eq!(pos.breached_side(dec!(30), dec!(50)), Some(Side::Up));
-    }
-
-    #[test]
-    fn breached_side_picks_deeper_when_both_breached() {
-        // up_pnl = 20 - 100 = -80, down_pnl = 10 - 100 = -90。都 ≤ -30，Down 更亏。
-        let pos = PositionSnapshot {
-            up_qty: dec!(20),
-            down_qty: dec!(10),
-            total_cost: dec!(100),
-        };
-        assert_eq!(pos.breached_side(dec!(30), dec!(0)), Some(Side::Down));
-    }
-
-    #[test]
-    fn weaker_side_returns_up_when_up_pnl_smaller() {
-        // up_pnl = 20-80 = -60, down_pnl = 100-80 = 20。Up 更弱。
-        let pos = PositionSnapshot {
-            up_qty: dec!(20),
-            down_qty: dec!(100),
-            total_cost: dec!(80),
-        };
-        assert_eq!(pos.weaker_side(), Some(Side::Up));
-    }
-
-    #[test]
-    fn weaker_side_returns_down_when_down_pnl_smaller() {
-        // up_pnl = 100-80 = 20, down_pnl = 30-80 = -50。Down 更弱。
-        let pos = PositionSnapshot {
-            up_qty: dec!(100),
-            down_qty: dec!(30),
-            total_cost: dec!(80),
-        };
-        assert_eq!(pos.weaker_side(), Some(Side::Down));
-    }
-
-    #[test]
-    fn weaker_side_returns_none_when_equal() {
-        // up_pnl = 50-80 = -30, down_pnl = 50-80 = -30。相等。
-        let pos = PositionSnapshot {
-            up_qty: dec!(50),
-            down_qty: dec!(50),
-            total_cost: dec!(80),
-        };
-        assert_eq!(pos.weaker_side(), None);
+        // 总成本 100，Up 120 → +20，Down 80 → −20。p=0.6 → 0.6×20+0.4×(−20)=4。
+        let p = pos(dec!(120), dec!(80), dec!(50), dec!(50));
+        assert_eq!(p.expected_value(dec!(0.6)), dec!(4.0));
     }
 }

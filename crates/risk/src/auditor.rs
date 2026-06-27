@@ -14,6 +14,8 @@ use rust_decimal::Decimal;
 pub enum RejectReason {
     /// 现金低于红线，不让开新仓。
     CashGuardBlocked,
+    /// 该侧敞口会超过最大单边敞口上限。
+    MaxExposureExceeded,
 }
 
 /// 审计结果：通过或拒绝。
@@ -74,12 +76,29 @@ impl RiskAuditor {
             Approval::Approved
         }
     }
+
+    /// 最大单边敞口上限（绝对金额）。
+    pub fn max_exposure(&self) -> Money {
+        self.pools.max_exposure()
+    }
+
+    /// 校验某侧敞口是否会超过最大单边敞口上限。
+    ///
+    /// `projected_exposure` = 未配对保护成本 + 该侧活跃挂单金额 + 拟发新单金额。
+    /// 超过 11.25%V 返回拒绝，否则放行。动态对冲撞此线会强制升级 EV。
+    pub fn check_exposure(&self, projected_exposure: Money) -> Approval {
+        if projected_exposure > self.max_exposure() {
+            Approval::Rejected(RejectReason::MaxExposureExceeded)
+        } else {
+            Approval::Approved
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use domain::order::{Generation, OrderDirection, OrderId};
+    use domain::order::{Generation, OrderDirection, OrderId, TimeInForce};
     use domain::types::{OrderRole, Side};
     use rust_decimal_macros::dec;
 
@@ -92,6 +111,7 @@ mod tests {
             price: dec!(0.4),
             qty: dec!(100),
             role: OrderRole::Maker,
+            time_in_force: TimeInForce::Gtc,
             generation: Generation::new(),
         }
     }
@@ -135,5 +155,32 @@ mod tests {
         let pools = CapitalPools::with_default_ratios(dec!(1000));
         // reserve 比例 = 0.25，设 guard = 0.20 → 应 panic。
         RiskAuditor::new(pools, dec!(0.20));
+    }
+
+    #[test]
+    fn max_exposure_is_eleven_point_two_five_percent() {
+        // 总资金 1000，动态对冲池 225 → 最大敞口 112.5。
+        assert_eq!(auditor().max_exposure(), dec!(112.5));
+    }
+
+    #[test]
+    fn exposure_approved_below_limit() {
+        // 预计敞口 100 < 112.5 → 放行。
+        assert_eq!(auditor().check_exposure(dec!(100)), Approval::Approved);
+    }
+
+    #[test]
+    fn exposure_approved_at_limit() {
+        // 边界：恰等于 112.5，不超过 → 放行。
+        assert_eq!(auditor().check_exposure(dec!(112.5)), Approval::Approved);
+    }
+
+    #[test]
+    fn exposure_rejected_above_limit() {
+        // 预计敞口 120 > 112.5 → 拒绝。
+        assert_eq!(
+            auditor().check_exposure(dec!(120)),
+            Approval::Rejected(RejectReason::MaxExposureExceeded)
+        );
     }
 }

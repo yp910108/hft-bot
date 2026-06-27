@@ -101,17 +101,26 @@ impl Ledger {
         }
     }
 
-    /// 双边累计净总成本，作为条件盈亏计算的总成本口径。
+    /// 查某一侧的累计投入成本（含费），没持仓时为 0。
+    pub fn cost(&self, side: Side) -> Money {
+        match side {
+            Side::Up => self.up.cost,
+            Side::Down => self.down.cost,
+        }
+    }
+
+    /// 双边累计净总成本，作为结算盈亏计算的总成本口径。
     pub fn total_cost(&self) -> Money {
         self.up.cost + self.down.cost
     }
 
-    /// 产出当前持仓快照，供 domain 层计算条件盈亏与数学期望。
+    /// 产出当前持仓快照，供 domain 层计算盈亏与数学期望。
     pub fn snapshot(&self) -> PositionSnapshot {
         PositionSnapshot {
             up_qty: self.up.qty,
             down_qty: self.down.qty,
-            total_cost: self.total_cost(),
+            up_cost: self.up.cost,
+            down_cost: self.down.cost,
         }
     }
 }
@@ -340,7 +349,25 @@ mod tests {
         // 两边股数 100 均大于成本 85 → 已锁定双向利润。
         assert_eq!(snapshot.up_qty, dec!(100));
         assert_eq!(snapshot.down_qty, dec!(100));
-        assert_eq!(snapshot.total_cost, dec!(85));
-        assert!(snapshot.is_profit_locked());
+        assert_eq!(snapshot.total_cost(), dec!(85));
+        assert_eq!(snapshot.up_cost, dec!(40));
+        assert_eq!(snapshot.down_cost, dec!(45));
+        // 两侧结算 pnl 均为正 → 锁定利润。
+        assert!(snapshot.settle_pnl(Side::Up) > Money::ZERO);
+        assert!(snapshot.settle_pnl(Side::Down) > Money::ZERO);
+    }
+
+    #[test]
+    fn cost_accessor_returns_per_side_cost() {
+        let mut ledger = Ledger::new();
+        ledger.apply_fill(&fill(
+            Side::Up,
+            OrderDirection::Buy,
+            dec!(0.4),
+            dec!(100),
+            dec!(40),
+        ));
+        assert_eq!(ledger.cost(Side::Up), dec!(40));
+        assert_eq!(ledger.cost(Side::Down), Money::ZERO);
     }
 }

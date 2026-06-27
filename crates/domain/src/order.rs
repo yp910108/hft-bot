@@ -75,6 +75,17 @@ pub enum OrderDirection {
     Sell,
 }
 
+/// 订单的有效期模式，决定挂不上时怎么处理。
+///
+/// - `Gtc`（Good-Til-Canceled）：挂上去一直留在订单簿，等成交或被撤。做市/对冲的 Maker 单用。
+/// - `Ioc`（Immediate-Or-Cancel）：能立即成交的部分成交，剩下的立刻撤销，不留在簿上。
+///   EV 对冲的 Taker 扫盘用——发价格上限 0.85 的 IOC，吃掉 best_ask 到 0.85 的流动性，超出即撤。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TimeInForce {
+    Gtc,
+    Ioc,
+}
+
 /// 一笔挂单的描述。
 ///
 /// `role` 标明这笔单意图作为 Maker 还是 Taker 成交，决定适用费率与所处策略阶段
@@ -93,6 +104,8 @@ pub struct Order {
     pub qty: Qty,
     /// 撮合角色（Maker / Taker）。
     pub role: OrderRole,
+    /// 有效期模式（Gtc 挂单 / Ioc 即时成交剩余撤销）。
+    pub time_in_force: TimeInForce,
     /// 所属世代，用于竞态隔离。
     pub generation: Generation,
 }
@@ -228,6 +241,7 @@ mod tests {
             price: Price::ZERO,
             qty: Qty::ZERO,
             role: OrderRole::Maker,
+            time_in_force: TimeInForce::Gtc,
             generation: Generation::new(),
         };
         let command = Command::SubmitOrder(order);

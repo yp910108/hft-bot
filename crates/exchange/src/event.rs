@@ -5,6 +5,10 @@
 use domain::market::MarketSnapshot;
 use domain::order::{Fill, OrderId};
 
+/// 定时器标识：每次启动一个单步超时定时器分配一个，到期时凭它认领。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TimerId(pub u64);
+
 /// 订单被拒的原因。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectReason {
@@ -34,6 +38,10 @@ pub enum ExchangeEvent {
     },
     /// 撤单确认。
     Canceled(OrderId),
+    /// 撤单失败：目标订单已不在簿上（通常因为已成交，对应的 Fill 会另行回报）。
+    CancelFailed(OrderId),
+    /// 定时器到期：单步生命周期超时等的兜底信号，由 engine 注入事件队列。
+    TimerFired(TimerId),
 }
 
 #[cfg(test)]

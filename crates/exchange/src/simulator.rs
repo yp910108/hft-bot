@@ -138,6 +138,12 @@ impl ExchangeBackend for Simulator {
     fn cancel_order(&mut self, order_id: OrderId) {
         if self.resting_orders.remove(&order_id).is_some() {
             let _ = self.event_sender.send(ExchangeEvent::Canceled(order_id));
+        } else {
+            // 目标不在簿上（已成交或从未挂上）→ 撤单失败。
+            // 真实状态以回调为准：若因已成交，对应 Fill 会另行回报。
+            let _ = self
+                .event_sender
+                .send(ExchangeEvent::CancelFailed(order_id));
         }
     }
 
@@ -166,6 +172,7 @@ mod tests {
     use super::*;
     use domain::market::BookTop;
     use domain::order::Generation;
+    use domain::order::TimeInForce;
     use domain::types::OrderRole;
     use rust_decimal_macros::dec;
 
@@ -183,6 +190,7 @@ mod tests {
             price,
             qty,
             role: OrderRole::Maker,
+            time_in_force: TimeInForce::Gtc,
             generation: Generation::new(),
         }
     }
@@ -335,6 +343,14 @@ mod tests {
         simulator.cancel_order(OrderId(1));
         assert_eq!(simulator.resting_order_count(), 0);
         assert_eq!(rx.try_recv(), Ok(ExchangeEvent::Canceled(OrderId(1))));
+    }
+
+    #[test]
+    fn cancel_missing_order_reports_failure() {
+        let (mut simulator, mut rx) = Simulator::new(FeeModel::zero());
+        // 撤一个根本不在簿上的单（已成交或从未挂上）→ CancelFailed。
+        simulator.cancel_order(OrderId(99));
+        assert_eq!(rx.try_recv(), Ok(ExchangeEvent::CancelFailed(OrderId(99))));
     }
 
     #[test]

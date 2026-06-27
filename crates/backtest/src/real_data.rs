@@ -73,6 +73,7 @@ fn parse_price(field: &str) -> Option<Price> {
 
 /// 加载单个 CSV 文件为一场回测市场数据。
 pub fn load_market<P: AsRef<Path>>(path: P) -> Result<Market, LoadError> {
+    let path = path.as_ref();
     let content = fs::read_to_string(path)?;
     let mut lines = content.lines();
 
@@ -120,24 +121,59 @@ pub fn load_market<P: AsRef<Path>>(path: P) -> Result<Market, LoadError> {
     let pm = last_pm_price.unwrap_or(ptb);
     let winner = if pm > ptb { Side::Up } else { Side::Down };
 
-    Ok(Market { snapshots, winner })
+    Ok(Market {
+        snapshots,
+        winner,
+        title: market_title(path),
+    })
 }
 
-/// 加载指定目录下的所有 CSV 文件为市场数据列表。
+/// 从文件路径拼出场标题，如 "BTC 15m - 2026-05-22 07:30"。
+/// 目录名当日期，文件名 `07_30_508877.csv` 取前两段当时刻。
+fn market_title(path: &Path) -> String {
+    let date = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    let parts: Vec<&str> = stem.split('_').collect();
+    let time = if parts.len() >= 2 {
+        format!("{}:{}", parts[0], parts[1])
+    } else {
+        stem.to_string()
+    };
+    format!("BTC 15m - {date} {time}")
+}
+
+/// 加载指定目录下的所有 CSV 文件为市场数据列表（递归子目录）。
 pub fn load_dir<P: AsRef<Path>>(dir: P) -> Result<Vec<Market>, LoadError> {
-    let mut entries: Vec<_> = fs::read_dir(&dir)?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|ext| ext == "csv"))
-        .collect();
-    entries.sort();
+    let mut paths = Vec::new();
+    collect_csv(dir.as_ref(), &mut paths)?;
+    paths.sort();
     let mut markets = Vec::new();
-    for path in entries {
+    for path in paths {
         if let Ok(market) = load_market(&path) {
             markets.push(market);
         }
     }
     Ok(markets)
+}
+
+/// 递归收集目录下所有 .csv 文件路径。
+fn collect_csv(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> Result<(), LoadError> {
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            collect_csv(&path, out)?;
+        } else if path.extension().is_some_and(|ext| ext == "csv") {
+            out.push(path);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 domain = { path = "../domain" }
+exchange = { path = "../exchange" }
 fsm = { path = "../fsm" }
 ledger = { path = "../ledger" }
 rust_decimal = { workspace = true }

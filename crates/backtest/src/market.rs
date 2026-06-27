@@ -12,4 +12,6 @@ pub struct Market {
     pub snapshots: Vec<MarketSnapshot>,
     /// 交割时的胜出方。
     pub winner: Side,
+    /// 场标题（报告展示用），如 "BTC 15m - 2026-05-22 07:30"。
+    pub title: String,
 }
