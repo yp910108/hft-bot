@@ -5,11 +5,7 @@
 use domain::market::MarketSnapshot;
 use domain::order::{Fill, OrderId};
 
-/// 定时器标识：每次启动一个单步超时定时器分配一个，到期时凭它认领。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct TimerId(pub u64);
-
-/// 订单被拒的原因。
+/// 订单被拒的原因（交易所层面的拒绝，不含本地风控拦截）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectReason {
     /// 现金不够下这笔单。
@@ -18,8 +14,6 @@ pub enum RejectReason {
     BelowMinOrderSize,
     /// 价格不符合最小 tick。
     InvalidPrice,
-    /// 被 Cash Guard 红线拦截。
-    CashGuardBlocked,
 }
 
 /// 交易所异步回报事件。
@@ -40,8 +34,6 @@ pub enum ExchangeEvent {
     Canceled(OrderId),
     /// 撤单失败：目标订单已不在簿上（通常因为已成交，对应的 Fill 会另行回报）。
     CancelFailed(OrderId),
-    /// 定时器到期：单步生命周期超时等的兜底信号，由 engine 注入事件队列。
-    TimerFired(TimerId),
 }
 
 #[cfg(test)]
@@ -75,12 +67,12 @@ mod tests {
     fn rejected_event_carries_order_id_and_reason() {
         let event = ExchangeEvent::Rejected {
             order_id: OrderId(3),
-            reason: RejectReason::CashGuardBlocked,
+            reason: RejectReason::InvalidPrice,
         };
         match event {
             ExchangeEvent::Rejected { order_id, reason } => {
                 assert_eq!(order_id, OrderId(3));
-                assert_eq!(reason, RejectReason::CashGuardBlocked);
+                assert_eq!(reason, RejectReason::InvalidPrice);
             }
             _ => panic!("应为 Rejected 事件"),
         }

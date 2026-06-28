@@ -8,7 +8,7 @@
 //! - 时间红线：任意非终态 → SettlementWait（最高优先级硬中断）。
 //! - 熔断：任意非终态、非熔断态 → CircuitBreaker。
 //! - 熔断恢复：CircuitBreaker → 任意阶段态（带记忆重走全局路由）。
-//! - 阶段推进：Building→Pairing→{DynamicHedge↔Observing}→EvHedge。
+//! - 阶段推进：Building → Pairing → DynamicHedge → EvHedge。
 
 use domain::state::RobotState;
 
@@ -42,20 +42,19 @@ pub fn is_legal_transition(from: RobotState, to: RobotState) -> bool {
         // 建仓 → 配对（首笔成交）。
         (Building, Pairing) => true,
 
-        // 配对 → 动态对冲（结算/浮亏穿线）。
+        // 配对 → 动态对冲（结算/浮亏穿线 或 尾盘规则）。
         (Pairing, DynamicHedge { .. }) => true,
 
-        // 动态对冲 ↔ 观察态，以及 → EV。
-        (DynamicHedge { .. }, Observing { .. }) => true,
+        // 动态对冲 → EV（TTE<5min 且双边负2次/尾盘破线）。
         (DynamicHedge { .. }, EvHedge) => true,
-        (Observing { .. }, DynamicHedge { .. }) => true,
-        (Observing { .. }, EvHedge) => true,
+
+        // 配对 → EV（TTE<5min 尾盘规则可直接从配对态进 EV）。
+        (Pairing, EvHedge) => true,
 
         // 熔断恢复：带记忆重走路由，可落到任意阶段态。
         (CircuitBreaker, Building) => true,
         (CircuitBreaker, Pairing) => true,
         (CircuitBreaker, DynamicHedge { .. }) => true,
-        (CircuitBreaker, Observing { .. }) => true,
         (CircuitBreaker, EvHedge) => true,
 
         _ => false,
@@ -108,11 +107,6 @@ mod tests {
             double_negative_count: n,
         }
     }
-    fn observing(n: u8) -> RobotState {
-        Observing {
-            double_negative_count: n,
-        }
-    }
 
     #[test]
     fn starts_in_building() {
@@ -135,7 +129,7 @@ mod tests {
 
     #[test]
     fn time_red_line_reaches_settlement_from_any_phase() {
-        for from in [Building, Pairing, dynamic(0), observing(1), EvHedge, CircuitBreaker] {
+        for from in [Building, Pairing, dynamic(0), EvHedge, CircuitBreaker] {
             assert!(
                 is_legal_transition(from, SettlementWait),
                 "{from:?} 应能进 SettlementWait"
@@ -145,29 +139,26 @@ mod tests {
 
     #[test]
     fn circuit_breaker_reachable_from_any_phase_except_itself() {
-        for from in [Building, Pairing, dynamic(0), observing(1), EvHedge] {
+        for from in [Building, Pairing, dynamic(0), EvHedge] {
             assert!(
                 is_legal_transition(from, CircuitBreaker),
                 "{from:?} 应能进 CircuitBreaker"
             );
         }
-        // 熔断态不能再进熔断（自跳已由 same_state 处理，这里指非原地的语义边）。
-        // from==to 走 same_state 合法；此处确认没有额外的熔断→熔断语义。
     }
 
     #[test]
     fn normal_phase_progression_is_legal() {
         assert!(is_legal_transition(Building, Pairing));
         assert!(is_legal_transition(Pairing, dynamic(0)));
-        assert!(is_legal_transition(dynamic(0), observing(0)));
-        assert!(is_legal_transition(observing(1), dynamic(1)));
         assert!(is_legal_transition(dynamic(1), EvHedge));
-        assert!(is_legal_transition(observing(1), EvHedge));
+        // 配对态也能直接进 EV（尾盘规则）。
+        assert!(is_legal_transition(Pairing, EvHedge));
     }
 
     #[test]
     fn circuit_breaker_recovery_reaches_any_phase() {
-        for to in [Building, Pairing, dynamic(0), observing(0), EvHedge] {
+        for to in [Building, Pairing, dynamic(0), EvHedge] {
             assert!(
                 is_legal_transition(CircuitBreaker, to),
                 "熔断恢复应能到 {to:?}"
@@ -179,8 +170,8 @@ mod tests {
     fn illegal_skips_are_rejected() {
         // 建仓不能直接跳对冲（必须先进配对）。
         assert!(!is_legal_transition(Building, dynamic(0)));
-        // 配对不能直接跳 EV（必须先动态对冲）。
-        assert!(!is_legal_transition(Pairing, EvHedge));
+        // 建仓不能直接跳 EV。
+        assert!(!is_legal_transition(Building, EvHedge));
         // EV 不能退回动态对冲（认输后不回头）。
         assert!(!is_legal_transition(EvHedge, dynamic(0)));
         // 配对不能退回建仓。
@@ -193,7 +184,7 @@ mod tests {
         assert!(machine.transition_to(Pairing));
         assert_eq!(machine.state(), Pairing);
         // 非法跳转保持原状。
-        assert!(!machine.transition_to(EvHedge));
+        assert!(!machine.transition_to(Building));
         assert_eq!(machine.state(), Pairing);
         // 合法跳转生效。
         assert!(machine.transition_to(dynamic(0)));

@@ -85,7 +85,7 @@ impl RiskAuditor {
     /// 校验某侧敞口是否会超过最大单边敞口上限。
     ///
     /// `projected_exposure` = 未配对保护成本 + 该侧活跃挂单金额 + 拟发新单金额。
-    /// 超过 11.25%V 返回拒绝，否则放行。动态对冲撞此线会强制升级 EV。
+    /// 超过 11.25%V 返回拒绝，否则放行。动态对冲撞此线时原地挂机（Skip），不升级 EV。
     pub fn check_exposure(&self, projected_exposure: Money) -> Approval {
         if projected_exposure > self.max_exposure() {
             Approval::Rejected(RejectReason::MaxExposureExceeded)

@@ -3,6 +3,5 @@
 //! 策略只面向 trait 编程，换后端不改策略。
 
 pub mod backend;
-pub mod clock;
 pub mod event;
 pub mod simulator;
