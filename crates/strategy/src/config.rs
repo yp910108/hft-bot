@@ -3,7 +3,7 @@
 //! 比例类阈值（如 ±%V）以小数存储，运行时乘总资金 V 换算成绝对金额。
 //! 时间类阈值以毫秒存储（自场开始计）。价格类阈值就是价格小数。
 
-use exchange::clock::Millis;
+use domain::clock::Millis;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
@@ -43,9 +43,9 @@ pub struct StrategyConfig {
     pub making_profit_lock: Decimal,
     /// 动态对冲微利逃生线 +0.25%V。
     pub dynamic_escape: Decimal,
-    /// 观察线 −0.5%V。
+    /// 观察线 −0.5%V（pnl 在此以上进观察/静默）。
     pub observe_line: Decimal,
-    /// 亏损触发线 −2%V。
+    /// 亏损触发线 −2%V（全局共用）。
     pub loss_trigger: Decimal,
     /// 单边持仓门槛 3%V（结算 pnl 触发的对侧成本门槛）。
     pub single_side_threshold: Decimal,
@@ -53,7 +53,7 @@ pub struct StrategyConfig {
     // ---- 动态对冲 ----
     /// 单步资金占对冲池剩余的比例 7.5%。
     pub dynamic_step_fraction: Decimal,
-    /// 单步三档。
+    /// 单步三档（Min 取资金预算时使用）。
     pub dynamic_rungs: [HedgeRung; 3],
     /// 单步生命周期（毫秒），超时强制结束。
     pub dynamic_step_lifetime: Millis,
@@ -63,16 +63,16 @@ pub struct StrategyConfig {
     pub deep_sea_deviation: Decimal,
 
     // ---- EV 对冲 ----
+    /// EV 进入大门：TTE < 此值才允许进入 EV 态（5 分钟）。
+    pub ev_entry_window: Millis,
     /// 单步资金占 EV 池剩余的比例 25%。
     pub ev_step_fraction: Decimal,
     /// IOC 保护上限价。
     pub ev_price_cap: Decimal,
     /// 两步之间冷却（毫秒）。
     pub ev_cooldown: Millis,
-    /// 出手甜区：剩余 >5min 时优势方概率区间。
-    pub ev_sweet_far: (Decimal, Decimal),
-    /// 出手甜区：剩余 5min~1min 时优势方概率区间。
-    pub ev_sweet_near: (Decimal, Decimal),
+    /// 出手甜区（统一，TTE 5min~1min 时使用）。
+    pub ev_sweet: (Decimal, Decimal),
     /// 反转退出线：优势方概率跌破此值立即收手。
     pub ev_reversal: Decimal,
 
@@ -85,9 +85,9 @@ pub struct StrategyConfig {
     pub circuit_recover_stable: Millis,
 
     // ---- 时间红线 ----
-    /// 最后阶段阈值：剩余 < 此值时动态对冲失效（5min）。
+    /// 尾盘阈值：TTE < 此值时触发全局尾盘规则（5min）。
     pub last_phase_window: Millis,
-    /// 时间红线：剩余 < 此值时无条件收手扛结算（1min）。
+    /// 时间红线：TTE < 此值时无条件收手扛结算（1min）。
     pub time_red_line: Millis,
 }
 
@@ -139,11 +139,11 @@ impl Default for StrategyConfig {
             dynamic_cooldown: 1_000,
             deep_sea_deviation: dec!(0.03),
 
+            ev_entry_window: 300_000,
             ev_step_fraction: dec!(0.25),
             ev_price_cap: dec!(0.85),
             ev_cooldown: 2_000,
-            ev_sweet_far: (dec!(0.60), dec!(0.75)),
-            ev_sweet_near: (dec!(0.75), dec!(0.85)),
+            ev_sweet: (dec!(0.75), dec!(0.85)),
             ev_reversal: dec!(0.55),
 
             circuit_trigger_ratio: dec!(0.30),
@@ -191,5 +191,22 @@ mod tests {
         let cfg = StrategyConfig::default();
         // 时间红线 1min < 最后阶段窗口 5min。
         assert!(cfg.time_red_line < cfg.last_phase_window);
+    }
+
+    #[test]
+    fn ev_entry_window_equals_last_phase_window() {
+        let cfg = StrategyConfig::default();
+        // 两者数值相同（都是 5min），但语义独立。
+        assert_eq!(cfg.ev_entry_window, cfg.last_phase_window);
+    }
+
+    #[test]
+    fn ev_sweet_band_is_valid() {
+        let cfg = StrategyConfig::default();
+        let (low, high) = cfg.ev_sweet;
+        // 甜区下界 > 反转线，上界 < 1。
+        assert!(low > cfg.ev_reversal);
+        assert!(high < Decimal::ONE);
+        assert!(low < high);
     }
 }

@@ -3,8 +3,9 @@
 //! 纯函数：没有「我铺过没」的记忆，靠读 ctx 推断——
 //! 主战场无活跃挂单且无持仓 → 铺三档；一旦有持仓（首笔成交）→ 跳配对态。
 
+use crate::PhaseStrategy;
 use crate::config::StrategyConfig;
-use crate::context::{CommandIntent, Decision, DecisionContext, OrderIntent, PhaseStrategy};
+use crate::context::{CommandIntent, Decision, DecisionContext, OrderIntent};
 use domain::market::MarketSnapshot;
 use domain::state::RobotState;
 use domain::types::{Money, Price, Qty, Side};
@@ -87,7 +88,7 @@ impl PhaseStrategy for BuildingStrategy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::{ActiveOrder, PoolBudgets};
+    use crate::context::{ActiveOrder, PoolBudgets, Trigger};
     use domain::market::BookTop;
     use domain::order::{OrderConstraints, OrderDirection, OrderId};
     use domain::pnl::PositionSnapshot;
@@ -109,7 +110,7 @@ mod tests {
     ) -> DecisionContext<'a> {
         DecisionContext {
             total_capital: dec!(1000),
-            trigger: crate::context::Trigger::BookUpdate,
+            trigger: Trigger::BookUpdate,
             now: 0,
             time_to_expiry: 600_000,
             state: RobotState::Building,
@@ -126,6 +127,9 @@ mod tests {
             },
             active_orders: active,
             last_hedge_at: None,
+            funds_exhausted: false,
+            double_negative_count: 0,
+            was_double_negative: false,
             calm_since: None,
             constraints: OrderConstraints::default(),
         }
@@ -155,11 +159,21 @@ mod tests {
     }
 
     #[test]
+    fn selects_down_when_down_cheaper() {
+        let s = strat();
+        let market = MarketSnapshot {
+            up: book(Some(dec!(0.59)), Some(dec!(0.60))),
+            down: book(Some(dec!(0.39)), Some(dec!(0.40))),
+        };
+        assert_eq!(s.select_main_field(&market), Some(Side::Down));
+    }
+
+    #[test]
     fn no_main_field_when_neither_below_threshold() {
         let s = strat();
         let market = MarketSnapshot {
             up: book(Some(dec!(0.55)), Some(dec!(0.56))),
-            down: book(Some(dec!(0.44)), Some(dec!(0.52))),
+            down: book(Some(dec!(0.55)), Some(dec!(0.56))),
         };
         assert_eq!(s.select_main_field(&market), None);
     }
@@ -171,7 +185,7 @@ mod tests {
             down: book(Some(dec!(0.59)), Some(dec!(0.60))),
         };
         let d = strat().decide(&ctx(market, empty_pos(), &[]));
-        // 三档都满足最小量（150×2%/0.39≈7.6 股 > 5，金额 ≈3 > 1）→ 三条 Submit。
+        // 三档都满足最小量 → 三条 Submit。
         assert_eq!(d.commands.len(), 3);
         // 价格依次为 0.39/0.38/0.37（ask 0.40 减 0.01/0.02/0.03）。
         for (i, expected_price) in [dec!(0.39), dec!(0.38), dec!(0.37)].iter().enumerate() {
@@ -192,7 +206,6 @@ mod tests {
             up: book(Some(dec!(0.39)), Some(dec!(0.40))),
             down: BookTop::default(),
         };
-        // 已有 Up 持仓 → 首笔成交发生过 → 跳配对。
         let pos = PositionSnapshot {
             up_qty: dec!(10),
             down_qty: dec!(0),

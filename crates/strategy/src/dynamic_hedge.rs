@@ -1,19 +1,30 @@
-//! 动态对冲态 + 观察态：Maker 织网补亏损侧摊薄均价，戴双闸的有限赌反弹。
+//! 动态对冲态：Maker 织网补少仓侧摽齐（Delta Neutral）。
 //!
-//! 动态对冲每步在亏损大侧低位铺三档 Maker，单步资金 = 对冲池剩余 × 7.5%。
-//! 两道死闸任一触发即强制升级 EV：① 敞口撞 11.25%V ② 双边负 2 次。
-//! pnl 落入 (−2%V, +0.25%V) 进观察态静默等行情；≥+0.25%V 微利逃生。
+//! 目的：把双边股数摽平，让 sum_avg 压回 1 以下。受敞口红线约束，撞线即原地挂机，
+//! 绝不无限加仓、绝不因撞红线升级 EV。
 //!
-//! 观察态与动态对冲共用一个小策略：观察态只是「停发新单」，升级检查照跑。
+//! 决策顺序（每 tick）：
+//! 1. 微利逃生：两侧结算 pnl 都 ≥ +0.25%V → 撤单扛结算。
+//! 2. 资金耗尽黏住：funds_exhausted 已置 → Skip（不再对冲）。
+//! 3. 双边负 2 次 且 TTE<5min → 升级 EV（动态对冲专属失效信号）。
+//! 4. pnl 在安全区间 (−2%V, +0.25%V) → Skip 静默等行情。
+//! 5. 冷却中 → Skip。
+//! 6. 织网（带摽齐 Cap）：
+//!    a. 缺口 ≤ 0 或粉尘缺口 → 视同平齐：查利润达标则撤单扛结算，否则 Skip。
+//!    b. 缺口大但预算买不起最低单 → 资金耗尽：CancelAll + engine 置标志位。
+//!    c. 正常 → 选 Target Side，撤深海死单，Min(预算,缺口) 织网；敞口红线 → Skip 挂机。
+//!
+//! 双边负计数（double_negative_count / was_double_negative）是跨阶段全局量，
+//! 由 engine 统一维护。strategy 从 ctx 读取，通过 Decision::with_dn_update 表达更新意图。
 
+use crate::PhaseStrategy;
 use crate::config::StrategyConfig;
-use crate::context::{
-    ActiveOrder, CommandIntent, Decision, DecisionContext, OrderIntent, PhaseStrategy,
-};
+use crate::context::{CommandIntent, Decision, DecisionContext, OrderIntent};
+use domain::order::OrderId;
 use domain::state::RobotState;
-use domain::types::{Money, Price, Side};
+use domain::types::{Money, Price, Qty, Side};
 
-/// 动态对冲 + 观察态小策略。
+/// 动态对冲小策略。
 #[derive(Debug, Clone)]
 pub struct DynamicHedgeStrategy {
     cfg: StrategyConfig,
@@ -24,53 +35,85 @@ impl DynamicHedgeStrategy {
         Self { cfg }
     }
 
-    /// 当前双边负计数（从状态里取）。
-    fn double_negative_count(state: RobotState) -> u8 {
-        state.double_negative_count()
+    /// 边沿触发计数：只有从「非双边负」跳变为「双边负」时才 +1，持续双边负不重复计数。
+    ///
+    /// 从 ctx 全局上下文读 count/was，算出本 tick 最新值。
+    fn edge_triggered_count(&self, ctx: &DecisionContext) -> (u8, bool) {
+        let base = ctx.double_negative_count;
+        let was = ctx.was_double_negative;
+        let current = ctx.position.both_sides_settle_negative();
+        let count = if current && !was { base + 1 } else { base };
+        (count, current)
     }
 
-    /// 升级 EV 前先把可能的计数自增算进去：本 tick 若双边都负，count+1。
-    fn next_double_negative(&self, ctx: &DecisionContext) -> u8 {
-        let base = Self::double_negative_count(ctx.state);
-        if ctx.position.both_sides_settle_negative() {
-            base + 1
+    /// 选 Target Side = 持仓少的那侧。两侧相等返回 None（已平齐）。
+    fn target_side(ctx: &DecisionContext) -> Option<Side> {
+        let up = ctx.position.up_qty;
+        let down = ctx.position.down_qty;
+        if up < down {
+            Some(Side::Up)
+        } else if down < up {
+            Some(Side::Down)
         } else {
-            base
+            None
         }
     }
 
-    /// 是否在冷却中（距上次对冲不足冷却时长）。
-    fn in_cooldown(&self, ctx: &DecisionContext) -> bool {
-        match ctx.last_hedge_at {
-            Some(last) => ctx.now < last + self.cfg.dynamic_cooldown,
-            None => false,
-        }
-    }
-
-    /// 找出该侧偏离 best_ask 超过深海阈值的活跃挂单（要撤的死单）。
-    fn deep_sea_orders<'a>(&self, ctx: &'a DecisionContext, side: Side) -> Vec<&'a ActiveOrder> {
+    /// 找出 Target Side 偏离 best_ask 超过深海阈值的活跃挂单 ID。
+    fn deep_sea_orders<'a>(
+        &self,
+        ctx: &'a DecisionContext,
+        side: Side,
+    ) -> impl Iterator<Item = OrderId> + 'a {
+        let dev = self.cfg.deep_sea_deviation;
         let best_ask = ctx.market.book(side).best_ask;
-        match best_ask {
-            Some(ask) => ctx
-                .active_orders
-                .iter()
-                .filter(|o| o.side == side && (o.price - ask).abs() > self.cfg.deep_sea_deviation)
-                .collect(),
-            None => Vec::new(),
-        }
+        ctx.active_orders
+            .iter()
+            .filter(move |o| {
+                o.side == side && best_ask.is_some_and(|ask| (o.price - ask).abs() > dev)
+            })
+            .map(|o| o.order_id)
     }
 
-    /// 单步织网：在 side 侧铺三档 Maker。预算 = 对冲池剩余 × step_fraction。
-    fn weave_step(&self, ctx: &DecisionContext, side: Side) -> Vec<CommandIntent> {
+    /// 单步织网（带摽齐 Cap + 价位防重）。
+    fn weave(&self, ctx: &DecisionContext, side: Side, gap: Qty) -> Vec<CommandIntent> {
         let best_ask = match ctx.market.book(side).best_ask {
             Some(a) => a,
             None => return Vec::new(),
         };
         let step_budget = ctx.pools.dynamic_remaining * self.cfg.dynamic_step_fraction;
+        let first_price = ctx
+            .constraints
+            .quantize_price(best_ask - self.cfg.dynamic_rungs[0].price_offset);
+        if first_price <= Price::ZERO {
+            return Vec::new();
+        }
+        let budget_qty = step_budget / first_price;
+
+        if gap <= budget_qty {
+            // 摽齐 Cap：全挂第一档。
+            if ctx.has_active_order_at(side, first_price) {
+                return Vec::new();
+            }
+            let qty = ctx.constraints.quantize_qty(gap);
+            if ctx.constraints.is_satisfied(qty, first_price) {
+                return vec![CommandIntent::Submit(OrderIntent::maker_buy(
+                    side,
+                    first_price,
+                    qty,
+                ))];
+            }
+            return Vec::new();
+        }
+
+        // 三档蚕食。
         let mut cmds = Vec::new();
         for rung in &self.cfg.dynamic_rungs {
             let price = ctx.constraints.quantize_price(best_ask - rung.price_offset);
             if price <= Price::ZERO {
+                continue;
+            }
+            if ctx.has_active_order_at(side, price) {
                 continue;
             }
             let rung_budget = step_budget * rung.step_fraction;
@@ -82,47 +125,30 @@ impl DynamicHedgeStrategy {
         cmds
     }
 
-    /// 选要补的那一侧。
-    ///
-    /// 动态对冲的本意是把 sum_avg 拉回 1 以下，而 sum_avg 高的根因通常是双边没摽齐
-    /// （一侧重仓、对面太少）。所以补哪边的第一原则是**补持仓少的那侧去摽齐**：
-    /// 哪侧股数少就补哪侧。只有双边股数基本相等（缺口可忽略）时，才退化为
-    /// 「补浮亏最差侧摊薄站岗成本」。
-    ///
-    /// m000 那种 DN 264 / UP 0 的极端单边，按此逻辑会去补空仓的 UP，符合常识。
-    fn lame_side(&self, ctx: &DecisionContext) -> Side {
-        let up_qty = ctx.position.up_qty;
-        let down_qty = ctx.position.down_qty;
-
-        // 双边股数差距明显 → 补少的那侧摽齐。
-        if up_qty != down_qty {
-            return if up_qty < down_qty {
-                Side::Up
-            } else {
-                Side::Down
-            };
-        }
-
-        // 双边股数相等（含都为 0）：退化为补浮亏最差侧；都无浮亏则默认 Up。
-        [Side::Up, Side::Down]
-            .into_iter()
-            .filter_map(|s| {
-                ctx.market
-                    .book(s)
-                    .best_bid
-                    .and_then(|bid| ctx.position.float_pnl(s, bid))
-                    .map(|fp| (s, fp))
-            })
-            .min_by(|a, b| a.1.cmp(&b.1))
-            .map(|(s, _)| s)
-            .unwrap_or(Side::Up)
+    /// Target Side 自身总敞口是否超红线。
+    fn exposure_would_exceed(
+        &self,
+        ctx: &DecisionContext,
+        side: Side,
+        new_notional: Money,
+    ) -> bool {
+        let held = ctx.position.cost(side);
+        let active = ctx.active_notional(side);
+        held + active + new_notional > ctx.pools.max_exposure
     }
 
-    /// 补单后该侧投影敞口是否超红线。
-    fn exposure_would_exceed(&self, ctx: &DecisionContext, side: Side, new_notional: Money) -> bool {
-        let unpaired = ctx.position.unpaired_cost(side);
-        let active = ctx.active_notional(side);
-        unpaired + active + new_notional > ctx.pools.max_exposure
+    /// 平齐后处置：利润达标撤单扛结算，否则 Skip。
+    fn settle_or_idle(&self, ctx: &DecisionContext) -> Decision {
+        let escape = self.cfg.dynamic_escape * ctx.total_capital;
+        let up = ctx.position.settle_pnl(Side::Up);
+        let down = ctx.position.settle_pnl(Side::Down);
+        if up >= escape && down >= escape {
+            Decision::skip()
+                .with(CommandIntent::CancelAll)
+                .moving_to(RobotState::SettlementWait)
+        } else {
+            Decision::skip()
+        }
     }
 }
 
@@ -136,57 +162,77 @@ impl PhaseStrategy for DynamicHedgeStrategy {
         let down_settle = ctx.position.settle_pnl(Side::Down);
         let worst = up_settle.min(down_settle);
 
-        // ① 双边负 2 次 → 升级 EV（最高内部优先级，先于一切动作）。
-        let next_count = self.next_double_negative(ctx);
-        if next_count >= 2 {
-            return Decision::skip()
-                .with(CommandIntent::CancelAll)
-                .moving_to(RobotState::EvHedge);
-        }
-
-        // ② 微利逃生：两侧结算 pnl 都 ≥ +0.25%V → 撤单扛结算。
+        // 1. 微利逃生。
         if up_settle >= escape && down_settle >= escape {
             return Decision::skip()
                 .with(CommandIntent::CancelAll)
                 .moving_to(RobotState::SettlementWait);
         }
 
-        // ③ 观察区间 (−2%V, +0.25%V)：停发新单等行情。
-        //    但若计数本 tick 自增了（双边负但还没到 2），要把计数写回状态。
+        // 2. 资金耗尽黏住。
+        if ctx.funds_exhausted {
+            return Decision::skip();
+        }
+
+        // 边沿计数（从 ctx 全局量读）。
+        let (next_count, current_is_dn) = self.edge_triggered_count(ctx);
+
+        // 3. 双边负 2 次 且 TTE<5min → 升级 EV。
+        if next_count >= 2 && ctx.time_to_expiry < self.cfg.ev_entry_window {
+            return Decision::skip()
+                .with(CommandIntent::CancelAll)
+                .moving_to(RobotState::EvHedge)
+                .with_dn_update(next_count, current_is_dn);
+        }
+
+        // 4. 安全区间 → Skip。
         if worst > loss {
-            let target = RobotState::Observing {
-                double_negative_count: next_count,
-            };
-            // 已在观察态且计数没变 → 啥也不做；否则跳到（更新计数的）观察态。
-            if ctx.state == target {
-                return Decision::skip();
-            }
-            return Decision::transition(target);
+            return Decision::skip().with_dn_update(next_count, current_is_dn);
         }
 
-        // ④ pnl ≤ −2%V：继续对冲。先确认不在冷却中。
-        if self.in_cooldown(ctx) {
-            // 冷却中：保持对冲态（若当前是观察态，跌破线了要切回对冲态并更新计数）。
-            let target = RobotState::DynamicHedge {
-                double_negative_count: next_count,
-            };
-            if ctx.state == target {
-                return Decision::skip();
-            }
-            return Decision::transition(target);
+        // 5. 冷却中。
+        if ctx.in_cooldown(self.cfg.dynamic_cooldown) {
+            return Decision::skip().with_dn_update(next_count, current_is_dn);
         }
 
-        // 选要补的那一侧（持仓少的侧优先摽齐）。
-        let lame = self.lame_side(ctx);
+        // 6. 织网。
+        let Some(target) = Self::target_side(ctx) else {
+            return self.settle_or_idle(ctx).with_dn_update(next_count, current_is_dn);
+        };
 
-        // 先撤深海死单（占预算额度）。
+        let gap = ctx
+            .constraints
+            .quantize_qty(ctx.position.qty(target.opposite()) - ctx.position.qty(target));
+        let best_ask = match ctx.market.book(target).best_ask {
+            Some(a) => a,
+            None => return Decision::skip().with_dn_update(next_count, current_is_dn),
+        };
+        let first_price = ctx
+            .constraints
+            .quantize_price(best_ask - self.cfg.dynamic_rungs[0].price_offset);
+        if gap <= Qty::ZERO
+            || first_price <= Price::ZERO
+            || !ctx.constraints.is_satisfied(gap, first_price)
+        {
+            return self.settle_or_idle(ctx).with_dn_update(next_count, current_is_dn);
+        }
+
+        // 资金耗尽。
+        let step_budget = ctx.pools.dynamic_remaining * self.cfg.dynamic_step_fraction;
+        let budget_qty = ctx.constraints.quantize_qty(step_budget / first_price);
+        if !ctx.constraints.is_satisfied(budget_qty, first_price) {
+            return Decision::skip()
+                .with(CommandIntent::CancelAll)
+                .with_dn_update(next_count, current_is_dn);
+        }
+
+        // 正常织网。
         let mut decision = Decision::skip();
-        for dead in self.deep_sea_orders(ctx, lame) {
-            decision = decision.with(CommandIntent::Cancel(dead.order_id));
+        for dead_id in self.deep_sea_orders(ctx, target) {
+            decision = decision.with(CommandIntent::Cancel(dead_id));
         }
 
-        // 算本步织网指令，校验敞口红线。
-        let step = self.weave_step(ctx, lame);
+        let step = self.weave(ctx, target, gap);
         let new_notional: Money = step
             .iter()
             .filter_map(|c| match c {
@@ -195,35 +241,26 @@ impl PhaseStrategy for DynamicHedgeStrategy {
             })
             .sum();
 
-        if self.exposure_would_exceed(ctx, lame, new_notional) {
-            // ⑤ 敞口撞红线 → 拒绝下单 + 强制升级 EV。
-            return Decision::skip()
-                .with(CommandIntent::CancelAll)
-                .moving_to(RobotState::EvHedge);
+        if self.exposure_would_exceed(ctx, target, new_notional) {
+            return decision.with_dn_update(next_count, current_is_dn);
         }
 
-        // 正常织网。确保停在动态对冲态（更新计数）。
         for cmd in step {
             decision = decision.with(cmd);
         }
-        let target = RobotState::DynamicHedge {
-            double_negative_count: next_count,
-        };
-        if ctx.state != target {
-            decision = decision.moving_to(target);
-        }
-        decision
+
+        decision.with_dn_update(next_count, current_is_dn)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::{PoolBudgets, Trigger};
+    use crate::context::{ActiveOrder, PoolBudgets, Trigger};
     use domain::market::{BookTop, MarketSnapshot};
     use domain::order::{OrderConstraints, OrderDirection, OrderId};
     use domain::pnl::PositionSnapshot;
-    use domain::types::{OrderRole, Qty};
+    use domain::types::OrderRole;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
 
@@ -236,29 +273,26 @@ mod tests {
     }
 
     struct Builder {
-        state: RobotState,
         position: PositionSnapshot,
         market: MarketSnapshot,
         active: Vec<ActiveOrder>,
         now: u64,
+        tte: u64,
         last_hedge_at: Option<u64>,
+        funds_exhausted: bool,
+        dynamic_remaining: Decimal,
+        double_negative_count: u8,
+        was_double_negative: bool,
     }
 
     impl Builder {
         fn new() -> Self {
             Self {
-                state: RobotState::DynamicHedge {
-                    double_negative_count: 0,
-                },
-                // Up 亏损大侧（高位站岗）：Up 100@0.60=60, Down 50@0.30=15，总成本 75。
-                // up_settle = 100−75 = 25？不行，要让 Up 穿线。
-                // 设 Up 30 股 @ 成本 60（高位），Down 100 @ 成本 30，总成本 90。
-                // up_settle = 30−90 = −60 ≤ −20；down_settle = 100−90=10。worst=−60。
                 position: PositionSnapshot {
-                    up_qty: dec!(30),
-                    down_qty: dec!(100),
-                    up_cost: dec!(60),
-                    down_cost: dec!(30),
+                    up_qty: dec!(100),
+                    down_qty: dec!(0),
+                    up_cost: dec!(30),
+                    down_cost: dec!(0),
                 },
                 market: MarketSnapshot {
                     up: book(Some(dec!(0.28)), Some(dec!(0.30))),
@@ -266,7 +300,12 @@ mod tests {
                 },
                 active: Vec::new(),
                 now: 10_000,
+                tte: 600_000,
                 last_hedge_at: None,
+                funds_exhausted: false,
+                dynamic_remaining: dec!(225),
+                double_negative_count: 0,
+                was_double_negative: false,
             }
         }
 
@@ -275,8 +314,8 @@ mod tests {
                 total_capital: dec!(1000),
                 trigger: Trigger::Fill { side: Side::Up },
                 now: self.now,
-                time_to_expiry: 600_000,
-                state: self.state,
+                time_to_expiry: self.tte,
+                state: RobotState::DynamicHedge,
                 main_field: Some(Side::Up),
                 main_field_frozen: false,
                 position: self.position,
@@ -284,12 +323,15 @@ mod tests {
                 pools: PoolBudgets {
                     grid_maker_total: dec!(150),
                     grid_maker_remaining: dec!(150),
-                    dynamic_remaining: dec!(225),
+                    dynamic_remaining: self.dynamic_remaining,
                     ev_remaining: dec!(375),
                     max_exposure: dec!(112.5),
                 },
                 active_orders: &self.active,
                 last_hedge_at: self.last_hedge_at,
+                funds_exhausted: self.funds_exhausted,
+                double_negative_count: self.double_negative_count,
+                was_double_negative: self.was_double_negative,
                 calm_since: None,
                 constraints: OrderConstraints::default(),
             }
@@ -301,8 +343,7 @@ mod tests {
     }
 
     #[test]
-    fn weaves_three_rungs_on_lame_side() {
-        // 基线 Up 30 / Down 100，Up 是持仓少侧 → 补 Up，在 Up best_ask 0.30 下方铺三档。
+    fn weaves_on_target_side_down() {
         let d = strat().decide(&Builder::new().build());
         let submits: Vec<_> = d
             .commands
@@ -312,82 +353,19 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(submits.len(), 3);
-        assert!(submits.iter().all(|o| o.side == Side::Up));
-        // 价格 0.29/0.28/0.27。
-        assert_eq!(submits[0].price, dec!(0.29));
-        assert_eq!(submits[1].price, dec!(0.28));
-        assert_eq!(submits[2].price, dec!(0.27));
+        assert!(!submits.is_empty(), "应在 Down 侧织网");
+        assert!(submits.iter().all(|o| o.side == Side::Down));
     }
 
     #[test]
-    fn weaves_on_empty_side_when_one_sided() {
-        // m000 场景：Down 重仓裸露、Up 空仓 → 应补空仓的 Up（摽齐），不是补已重仓的 Down。
-        let mut b = Builder::new();
-        b.position = PositionSnapshot {
-            up_qty: dec!(0),
-            down_qty: dec!(264),
-            up_cost: dec!(0),
-            down_cost: dec!(108),
-        };
-        // 两侧都给盘口，确认它选的是空仓的 Up 而非重仓的 Down。
-        b.market = MarketSnapshot {
-            up: book(Some(dec!(0.58)), Some(dec!(0.60))),
-            down: book(Some(dec!(0.38)), Some(dec!(0.40))),
-        };
-        let d = strat().decide(&b.build());
-        let submits: Vec<_> = d
-            .commands
-            .iter()
-            .filter_map(|c| match c {
-                CommandIntent::Submit(o) => Some(o),
-                _ => None,
-            })
-            .collect();
-        assert!(!submits.is_empty(), "应在 Up 侧织网");
-        assert!(
-            submits.iter().all(|o| o.side == Side::Up),
-            "单边裸露时必须补空仓的 Up，而不是已重仓的 Down"
-        );
-    }
-
-    #[test]
-    fn step_budget_is_7_5_percent_of_remaining() {
-        // 对冲池剩余 225 × 7.5% = 16.875。第一档 40% = 6.75，价 0.29 → 23.27 股。
+    fn empty_side_weave_not_upgrade_ev() {
         let d = strat().decide(&Builder::new().build());
-        let first = d.commands.iter().find_map(|c| match c {
-            CommandIntent::Submit(o) => Some(o),
-            _ => None,
-        });
-        let qty = first.unwrap().qty;
-        // 6.75 / 0.29 = 23.27... 量化到 2 位 = 23.27。
-        assert_eq!(qty, ctx_qty(dec!(16.875) * dec!(0.40), dec!(0.29)));
-    }
-
-    fn ctx_qty(budget: Money, price: Price) -> Qty {
-        OrderConstraints::default().quantize_qty(budget / price)
+        assert_ne!(d.transition, Some(RobotState::EvHedge));
     }
 
     #[test]
-    fn cooldown_blocks_new_step() {
+    fn micro_escape_settles() {
         let mut b = Builder::new();
-        // 上次对冲在 9500，冷却 1000 → 现在 10000 < 10500，冷却中。
-        b.last_hedge_at = Some(dec_to_u64(dec!(9500)));
-        b.now = 10_000;
-        let d = strat().decide(&b.build());
-        // 冷却中不发新单（无 Submit）。
-        assert!(!d.commands.iter().any(|c| matches!(c, CommandIntent::Submit(_))));
-    }
-
-    fn dec_to_u64(d: Decimal) -> u64 {
-        use rust_decimal::prelude::ToPrimitive;
-        d.to_u64().unwrap()
-    }
-
-    #[test]
-    fn micro_escape_settles_when_both_above_quarter_percent() {
-        let mut b = Builder::new();
-        // 两侧结算 pnl 都 ≥ +0.25%V(=2.5)：Up 100/Down 100，成本 90 → 都 +10。
         b.position = PositionSnapshot {
             up_qty: dec!(100),
             down_qty: dec!(100),
@@ -400,9 +378,49 @@ mod tests {
     }
 
     #[test]
-    fn enters_observing_in_band() {
+    fn funds_exhausted_sticks_skip() {
         let mut b = Builder::new();
-        // pnl 落在 (−20, +2.5)：Up 88/Down 100，成本 90 → up −2、down +10，worst −2 > −20。
+        b.funds_exhausted = true;
+        let d = strat().decide(&b.build());
+        assert!(d.is_skip());
+    }
+
+    #[test]
+    fn double_negative_twice_upgrades_ev_when_tte_small() {
+        let mut b = Builder::new();
+        b.double_negative_count = 1;
+        b.was_double_negative = false;
+        b.position = PositionSnapshot {
+            up_qty: dec!(40),
+            down_qty: dec!(50),
+            up_cost: dec!(50),
+            down_cost: dec!(50),
+        };
+        b.tte = 200_000;
+        let d = strat().decide(&b.build());
+        assert!(d.commands.contains(&CommandIntent::CancelAll));
+        assert_eq!(d.transition, Some(RobotState::EvHedge));
+    }
+
+    #[test]
+    fn double_negative_twice_no_ev_when_tte_large() {
+        let mut b = Builder::new();
+        b.double_negative_count = 1;
+        b.was_double_negative = false;
+        b.position = PositionSnapshot {
+            up_qty: dec!(40),
+            down_qty: dec!(50),
+            up_cost: dec!(50),
+            down_cost: dec!(50),
+        };
+        b.tte = 600_000;
+        let d = strat().decide(&b.build());
+        assert_ne!(d.transition, Some(RobotState::EvHedge));
+    }
+
+    #[test]
+    fn observe_band_skips() {
+        let mut b = Builder::new();
         b.position = PositionSnapshot {
             up_qty: dec!(88),
             down_qty: dec!(100),
@@ -410,77 +428,139 @@ mod tests {
             down_cost: dec!(45),
         };
         let d = strat().decide(&b.build());
-        assert_eq!(
-            d.transition,
-            Some(RobotState::Observing {
-                double_negative_count: 0
-            })
-        );
-        assert!(d.commands.is_empty());
+        assert!(!d.commands.iter().any(|c| matches!(c, CommandIntent::Submit(_))));
     }
 
     #[test]
-    fn double_negative_twice_upgrades_to_ev() {
+    fn cooldown_blocks_new_step() {
         let mut b = Builder::new();
-        // 已经 count=1，本 tick 双边都负 → next=2 → 升级 EV。
-        b.state = RobotState::DynamicHedge {
-            double_negative_count: 1,
-        };
-        // 双边都负：Up 40/Down 50，成本 100 → 都负。
-        b.position = PositionSnapshot {
-            up_qty: dec!(40),
-            down_qty: dec!(50),
-            up_cost: dec!(50),
-            down_cost: dec!(50),
-        };
+        b.last_hedge_at = Some(9_500);
+        b.now = 10_000;
         let d = strat().decide(&b.build());
-        assert!(d.commands.contains(&CommandIntent::CancelAll));
-        assert_eq!(d.transition, Some(RobotState::EvHedge));
+        assert!(!d.commands.iter().any(|c| matches!(c, CommandIntent::Submit(_))));
     }
 
     #[test]
-    fn one_sided_weaves_empty_side_not_upgrade_ev() {
-        // Up 重仓裸露、Down 空仓 → 补空仓的 Down 摽齐（不是撞红线弹 EV）。
-        // 这修正了旧 bug：旧逻辑补已重仓侧会立刻撞敞口红线弹 EV。
+    fn exposure_breach_idles_not_upgrade_ev() {
         let mut b = Builder::new();
         b.position = PositionSnapshot {
-            up_qty: dec!(100),
+            up_qty: dec!(500),
             down_qty: dec!(0),
-            up_cost: dec!(112),
-            down_cost: dec!(20),
+            up_cost: dec!(150),
+            down_cost: dec!(0),
         };
-        // 让 Up 穿线（worst ≤ −20）：total=132，up_settle=100−132=−32。
-        b.market = MarketSnapshot {
-            up: book(Some(dec!(0.43)), Some(dec!(0.45))),
-            down: book(Some(dec!(0.53)), Some(dec!(0.55))),
-        };
+        b.active = vec![ActiveOrder {
+            order_id: OrderId(1),
+            side: Side::Down,
+            direction: OrderDirection::Buy,
+            price: dec!(0.69),
+            qty: dec!(170),
+            role: OrderRole::Maker,
+        }];
         let d = strat().decide(&b.build());
-        // 补空仓的 Down，不升级 EV。
-        let submits: Vec<_> = d
-            .commands
-            .iter()
-            .filter_map(|c| match c {
-                CommandIntent::Submit(o) => Some(o),
-                _ => None,
-            })
-            .collect();
-        assert!(submits.iter().all(|o| o.side == Side::Down), "应补空仓的 Down");
-        assert_ne!(d.transition, Some(RobotState::EvHedge), "补空仓侧不应撞红线弹 EV");
+        assert_ne!(d.transition, Some(RobotState::EvHedge));
+        assert!(!d.commands.iter().any(|c| matches!(c, CommandIntent::Submit(_))));
     }
 
     #[test]
-    fn cancels_deep_sea_orders_before_weaving() {
+    fn cancels_deep_sea_orders() {
         let mut b = Builder::new();
-        // Up 侧 best_ask 0.30，有个挂在 0.10 的死单（偏离 0.20 > 0.03）。
         b.active = vec![ActiveOrder {
             order_id: OrderId(9),
-            side: Side::Up,
+            side: Side::Down,
             direction: OrderDirection::Buy,
-            price: dec!(0.10),
+            price: dec!(0.50),
             qty: dec!(50),
             role: OrderRole::Maker,
         }];
         let d = strat().decide(&b.build());
         assert!(d.commands.contains(&CommandIntent::Cancel(OrderId(9))));
+    }
+
+    #[test]
+    fn cap_caps_at_gap_when_budget_rich() {
+        let b = Builder::new();
+        let ctx = b.build();
+        let cmds = strat().weave(&ctx, Side::Down, dec!(10));
+        assert_eq!(cmds.len(), 1);
+        if let CommandIntent::Submit(o) = &cmds[0] {
+            assert_eq!(o.qty, dec!(10));
+            assert_eq!(o.price, dec!(0.69));
+        } else {
+            panic!("应为单笔 Submit");
+        }
+    }
+
+    #[test]
+    fn weave_three_rungs_when_budget_tight() {
+        let b = Builder::new();
+        let ctx = b.build();
+        let cmds = strat().weave(&ctx, Side::Down, dec!(10000));
+        assert_eq!(cmds.len(), 3);
+    }
+
+    #[test]
+    fn weave_skips_occupied_price_levels() {
+        let mut b = Builder::new();
+        b.active = vec![
+            ActiveOrder {
+                order_id: OrderId(1),
+                side: Side::Down,
+                direction: OrderDirection::Buy,
+                price: dec!(0.69),
+                qty: dec!(10),
+                role: OrderRole::Maker,
+            },
+            ActiveOrder {
+                order_id: OrderId(2),
+                side: Side::Down,
+                direction: OrderDirection::Buy,
+                price: dec!(0.68),
+                qty: dec!(10),
+                role: OrderRole::Maker,
+            },
+        ];
+        let ctx = b.build();
+        let cmds = strat().weave(&ctx, Side::Down, dec!(10000));
+        assert_eq!(cmds.len(), 1);
+        if let CommandIntent::Submit(o) = &cmds[0] {
+            assert_eq!(o.price, dec!(0.67));
+        } else {
+            panic!("应只在未占用的 0.67 档发单");
+        }
+    }
+
+    #[test]
+    fn exposure_counts_target_held_cost() {
+        let mut b = Builder::new();
+        b.position = PositionSnapshot {
+            up_qty: dec!(200),
+            down_qty: dec!(190),
+            up_cost: dec!(124),
+            down_cost: dec!(110.2),
+        };
+        let d = strat().decide(&b.build());
+        assert!(
+            !d.commands.iter().any(|c| matches!(c, CommandIntent::Submit(_))),
+            "Target 侧持仓成本已逼近红线，补单应被挡住"
+        );
+    }
+
+    #[test]
+    fn idle_path_writes_back_edge_state() {
+        // 安全区间挂机也要通过 with_dn_update 写回边沿状态。
+        let mut b = Builder::new();
+        b.double_negative_count = 0;
+        b.was_double_negative = false;
+        // 两侧都负但 worst 在安全区间：Up 95/Down 96，成本 100 → up −5、down −4，worst=−5 > −20。
+        b.position = PositionSnapshot {
+            up_qty: dec!(95),
+            down_qty: dec!(96),
+            up_cost: dec!(50),
+            down_cost: dec!(50),
+        };
+        let d = strat().decide(&b.build());
+        // 边沿触发 count 0→1，was false→true。
+        assert_eq!(d.double_negative_update, Some((1, true)));
     }
 }

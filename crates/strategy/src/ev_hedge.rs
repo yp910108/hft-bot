@@ -1,13 +1,19 @@
-//! EV 对冲态：IOC Taker 顺势追优势方（方向翻转），终极止血。
+//! EV 对冲态：终极止血，动量顺势单边押注。
 //!
-//! 动态对冲双闸被冲破后认输：不再接亏损侧飞刀，改用 EV 池 Taker 追买优势方
-//! （概率 p>0.5 那侧），靠交割胜方刚性收益覆盖劣势方沉没成本。
+//! 战略意图翻转：不再追求 Delta Neutral，转为追买优势方（概率 ∈ [0.75, 0.85]），
+//! 靠交割胜方刚性收益覆盖全局沉没成本。
 //!
-//! 战略进入 ≠ 战术开火：进来后只有优势方概率落在分时段甜区才出手，
-//! 否则装死（Skip）。退出：EV>0 / 概率跌破 0.55 / 资金耗尽（<1min 由 router 兜底）。
+//! 决策逻辑（每 tick，此时已在 EV 态内）：
+//! 1. EV > 0 → 期望转正，撤单扛结算。
+//! 2. 优势方概率 < 0.55 → 反转退出，撤单扛结算。
+//! 3. 资金耗尽（EV 池买不起最低单）→ 撤单扛结算。
+//! 4. 冷却中 → Skip。
+//! 5. 概率 ∈ [0.75, 0.85] → 开火：IOC Taker 追买优势方。
+//! 6. 其他（概率在 [0.55, 0.75) 或 > 0.85）→ 装死等行情进甜区。
 
+use crate::PhaseStrategy;
 use crate::config::StrategyConfig;
-use crate::context::{CommandIntent, Decision, DecisionContext, OrderIntent, PhaseStrategy};
+use crate::context::{CommandIntent, Decision, DecisionContext, OrderIntent};
 use domain::state::RobotState;
 use domain::types::{Price, Side};
 use rust_decimal::Decimal;
@@ -33,23 +39,6 @@ impl EvHedgeStrategy {
             Some((Side::Down, down_p))
         }
     }
-
-    /// 当前剩余时间对应的出手甜区 [low, high]。
-    fn sweet_band(&self, ctx: &DecisionContext) -> (Decimal, Decimal) {
-        if ctx.time_to_expiry > self.cfg.last_phase_window {
-            self.cfg.ev_sweet_far
-        } else {
-            self.cfg.ev_sweet_near
-        }
-    }
-
-    /// 是否在冷却中。
-    fn in_cooldown(&self, ctx: &DecisionContext) -> bool {
-        match ctx.last_hedge_at {
-            Some(last) => ctx.now < last + self.cfg.ev_cooldown,
-            None => false,
-        }
-    }
 }
 
 impl PhaseStrategy for EvHedgeStrategy {
@@ -58,8 +47,7 @@ impl PhaseStrategy for EvHedgeStrategy {
             return Decision::skip();
         };
 
-        // 退出 ①：EV > 0 → 目的达成，撤单扛结算。
-        // EV 用结算口径，以 Up 胜出概率（Up 的 mark price）计算。
+        // 1. EV > 0 → 期望转正，撤单扛结算。
         let up_prob = ctx.market.mark_price(Side::Up).unwrap_or(Decimal::ZERO);
         if ctx.position.expected_value(up_prob) > Decimal::ZERO {
             return Decision::skip()
@@ -67,44 +55,51 @@ impl PhaseStrategy for EvHedgeStrategy {
                 .moving_to(RobotState::SettlementWait);
         }
 
-        // 退出 ②：优势方概率跌破 0.55 → 期望反转，立即收手。
+        // 2. 优势方概率 < 反转线 → 期望反转，撤单扛结算。
         if prob < self.cfg.ev_reversal {
             return Decision::skip()
                 .with(CommandIntent::CancelAll)
                 .moving_to(RobotState::SettlementWait);
         }
 
-        // 冷却中：装死等下一步。
-        if self.in_cooldown(ctx) {
-            return Decision::skip();
-        }
-
-        // 出手甜区判定。
-        let (low, high) = self.sweet_band(ctx);
-        if prob < low || prob > high {
-            // 迟滞区 [0.55,0.60) 或高位 (>上限)：装死，等市场审判，绝不做冤大头。
-            return Decision::skip();
-        }
-
-        // 在甜区 → 开火：IOC@0.85 Taker 追买优势方。
-        let best_ask = match ctx.market.book(adv_side).best_ask {
-            Some(a) => a,
-            None => return Decision::skip(),
-        };
+        // 3. 资金耗尽：单步预算在保护价 0.85 下连最低单都买不起 → 撤单扛结算。
+        //    用 ev_price_cap（而非 best_ask）校验，因为 IOC Limit 单交易所按 Limit Price 校验金额，
+        //    不受盘口闪空或低价粉尘影响。
         let step_budget = ctx.pools.ev_remaining * self.cfg.ev_step_fraction;
-        // 用保护上限价估算可买股数（保守：按 cap 算，实际成交价更低）。
-        let qty = ctx.constraints.quantize_qty(step_budget / self.cfg.ev_price_cap);
-        // 资金耗尽：剩余不够最小单 → 撤单扛结算。
-        if !ctx.constraints.is_satisfied(qty, best_ask) {
+        let qty = ctx
+            .constraints
+            .quantize_qty(step_budget / self.cfg.ev_price_cap);
+        if !ctx.constraints.is_satisfied(qty, self.cfg.ev_price_cap) {
             return Decision::skip()
                 .with(CommandIntent::CancelAll)
                 .moving_to(RobotState::SettlementWait);
         }
-        Decision::skip().with(CommandIntent::Submit(OrderIntent::ioc_taker_buy(
-            adv_side,
-            self.cfg.ev_price_cap,
-            qty,
-        )))
+
+        // 4. 冷却中 → 装死等下一步。
+        if ctx.in_cooldown(self.cfg.ev_cooldown) {
+            return Decision::skip();
+        }
+
+        // 5. 出手甜区判定：概率 ∈ [0.75, 0.85] → 开火（需盘口有合适的货）。
+        let (low, high) = self.cfg.ev_sweet;
+        if prob >= low && prob <= high {
+            // 盘口检查：best_ask 存在且 ≤ 保护价才开火，否则装死等盘口回来（不触发冷却）。
+            let can_fire = ctx
+                .market
+                .book(adv_side)
+                .best_ask
+                .is_some_and(|ask| ask <= self.cfg.ev_price_cap);
+            if can_fire {
+                return Decision::skip().with(CommandIntent::Submit(OrderIntent::ioc_taker_buy(
+                    adv_side,
+                    self.cfg.ev_price_cap,
+                    qty,
+                )));
+            }
+        }
+
+        // 6. 其他（概率不在甜区，或在甜区但盘口太贵/没货）→ 装死等行情。
+        Decision::skip()
     }
 }
 
@@ -115,6 +110,7 @@ mod tests {
     use domain::market::{BookTop, MarketSnapshot};
     use domain::order::OrderConstraints;
     use domain::pnl::PositionSnapshot;
+    use domain::types::OrderRole;
     use rust_decimal_macros::dec;
 
     fn book(bid: Price, ask: Price) -> BookTop {
@@ -128,7 +124,6 @@ mod tests {
     struct Builder {
         position: PositionSnapshot,
         market: MarketSnapshot,
-        tte: u64,
         now: u64,
         last_hedge_at: Option<u64>,
         ev_remaining: Decimal,
@@ -144,12 +139,11 @@ mod tests {
                     up_cost: dec!(50),
                     down_cost: dec!(50),
                 },
-                // Down 优势方，概率 0.68（在 >5min 甜区 [0.60,0.75] 内）。
+                // Down 优势方，概率 0.80（在甜区 [0.75, 0.85] 内）。
                 market: MarketSnapshot {
-                    up: book(dec!(0.31), dec!(0.33)),
-                    down: book(dec!(0.67), dec!(0.69)),
+                    up: book(dec!(0.19), dec!(0.21)),
+                    down: book(dec!(0.79), dec!(0.81)),
                 },
-                tte: 600_000,
                 now: 10_000,
                 last_hedge_at: None,
                 ev_remaining: dec!(375),
@@ -162,7 +156,7 @@ mod tests {
                 total_capital: dec!(1000),
                 trigger: Trigger::BookUpdate,
                 now: self.now,
-                time_to_expiry: self.tte,
+                time_to_expiry: 200_000, // 在 EV 窗口内（< 5min）。
                 state: RobotState::EvHedge,
                 main_field: Some(Side::Up),
                 main_field_frozen: false,
@@ -177,6 +171,9 @@ mod tests {
                 },
                 active_orders: NO_ORDERS,
                 last_hedge_at: self.last_hedge_at,
+                funds_exhausted: false,
+                double_negative_count: 0,
+                was_double_negative: false,
                 calm_since: None,
                 constraints: OrderConstraints::default(),
             }
@@ -188,38 +185,39 @@ mod tests {
     }
 
     #[test]
-    fn fires_ioc_taker_on_advantaged_side_in_sweet_band() {
+    fn fires_ioc_taker_in_sweet_band() {
+        // Down 优势方概率 0.80 ∈ [0.75, 0.85] → 开火。
         let d = strat().decide(&Builder::new().build());
         let order = d.commands.iter().find_map(|c| match c {
             CommandIntent::Submit(o) => Some(o),
             _ => None,
         });
         let o = order.expect("甜区内应开火");
-        assert_eq!(o.side, Side::Down); // 优势方
-        assert_eq!(o.price, dec!(0.85)); // IOC 保护上限
-        assert_eq!(o.role, domain::types::OrderRole::Taker);
+        assert_eq!(o.side, Side::Down);
+        assert_eq!(o.price, dec!(0.85));
+        assert_eq!(o.role, OrderRole::Taker);
         assert_eq!(o.time_in_force, domain::order::TimeInForce::Ioc);
     }
 
     #[test]
-    fn skips_in_hysteresis_band() {
+    fn skips_below_sweet_band() {
         let mut b = Builder::new();
-        // 优势方概率 0.58 ∈ [0.55,0.60) 迟滞区 → 装死。
+        // 优势方概率 0.68 ∈ [0.55, 0.75) → 装死。
         b.market = MarketSnapshot {
-            up: book(dec!(0.41), dec!(0.43)),
-            down: book(dec!(0.57), dec!(0.59)),
+            up: book(dec!(0.31), dec!(0.33)),
+            down: book(dec!(0.67), dec!(0.69)),
         };
         let d = strat().decide(&b.build());
         assert!(d.is_skip());
     }
 
     #[test]
-    fn skips_when_probability_above_band() {
+    fn skips_above_sweet_band() {
         let mut b = Builder::new();
-        // 优势方概率 0.80 > 甜区上限 0.75 → 装死不做冤大头。
+        // 优势方概率 0.90 > 0.85 → 装死不做冤大头。
         b.market = MarketSnapshot {
-            up: book(dec!(0.19), dec!(0.21)),
-            down: book(dec!(0.79), dec!(0.81)),
+            up: book(dec!(0.09), dec!(0.11)),
+            down: book(dec!(0.89), dec!(0.91)),
         };
         let d = strat().decide(&b.build());
         assert!(d.is_skip());
@@ -228,7 +226,7 @@ mod tests {
     #[test]
     fn reversal_exit_when_prob_below_055() {
         let mut b = Builder::new();
-        // 优势方概率 0.52 < 0.55 → 反转退出收手。
+        // 优势方概率 0.52 < 0.55 → 反转退出。
         b.market = MarketSnapshot {
             up: book(dec!(0.47), dec!(0.49)),
             down: book(dec!(0.51), dec!(0.53)),
@@ -241,7 +239,7 @@ mod tests {
     #[test]
     fn ev_positive_exits_to_settlement() {
         let mut b = Builder::new();
-        // 让 EV > 0：Up 200/Down 200，成本 100 → 两侧 settle 都 +100，EV 必 >0。
+        // EV > 0：Up 200/Down 200，成本 100 → 两侧 settle 都 +100，EV 必 >0。
         b.position = PositionSnapshot {
             up_qty: dec!(200),
             down_qty: dec!(200),
@@ -263,23 +261,16 @@ mod tests {
     }
 
     #[test]
-    fn near_window_uses_higher_band() {
+    fn funds_exhausted_exits() {
         let mut b = Builder::new();
-        // 剩余 4min（<5min 窗口）→ 甜区 [0.75,0.85]。概率 0.68 不在内 → 装死。
-        b.tte = 240_000;
+        b.ev_remaining = dec!(0.01); // 几乎没钱了。
         let d = strat().decide(&b.build());
-        assert!(d.is_skip());
-        // 概率 0.80 在 [0.75,0.85] 内 → 开火。
-        b.market = MarketSnapshot {
-            up: book(dec!(0.19), dec!(0.21)),
-            down: book(dec!(0.79), dec!(0.81)),
-        };
-        let d = strat().decide(&b.build());
-        assert!(d.commands.iter().any(|c| matches!(c, CommandIntent::Submit(_))));
+        assert!(d.commands.contains(&CommandIntent::CancelAll));
+        assert_eq!(d.transition, Some(RobotState::SettlementWait));
     }
 
     #[test]
-    fn ev_step_is_25_percent_of_remaining() {
+    fn step_is_25_percent_of_remaining() {
         // EV 池 375 × 25% = 93.75，/ 0.85 = 110.29 股。
         let d = strat().decide(&Builder::new().build());
         let qty = d.commands.iter().find_map(|c| match c {
@@ -288,5 +279,35 @@ mod tests {
         });
         let expected = OrderConstraints::default().quantize_qty(dec!(93.75) / dec!(0.85));
         assert_eq!(qty, Some(expected));
+    }
+
+    #[test]
+    fn funds_exhausted_uses_price_cap_not_best_ask() {
+        // 回归 bug1：资金耗尽判定用保护价 0.85 校验，不受盘口闪空影响。
+        // 场景：EV 池有钱（375），但盘口 best_ask = None（闪空）→ 不应误判资金耗尽。
+        let mut b = Builder::new();
+        b.market = MarketSnapshot {
+            up: BookTop::default(),                          // 盘口闪空
+            down: BookTop::default(),
+        };
+        let d = strat().decide(&b.build());
+        // 盘口闪空 → advantaged() 返回 None → Skip（不是 CancelAll 退出）。
+        assert!(!d.commands.contains(&CommandIntent::CancelAll));
+        assert_ne!(d.transition, Some(RobotState::SettlementWait));
+    }
+
+    #[test]
+    fn no_fire_when_ask_above_cap() {
+        // 回归 bug2：盘口最便宜价格已超保护上限 → 不发无意义的一枪，装死等行情。
+        let mut b = Builder::new();
+        // Down 优势方：mark=(0.72+0.90)/2=0.81 ∈ 甜区 [0.75,0.85]，但 best_ask 0.90 > 0.85 保护价。
+        b.market = MarketSnapshot {
+            up: book(dec!(0.10), dec!(0.28)),
+            down: book(dec!(0.72), dec!(0.90)), // ask 0.90 > cap 0.85，但 mark 0.81 在甜区
+        };
+        let d = strat().decide(&b.build());
+        // 不开火（装死），不触发冷却。
+        assert!(!d.commands.iter().any(|c| matches!(c, CommandIntent::Submit(_))));
+        assert!(d.is_skip());
     }
 }

@@ -7,10 +7,12 @@
 //! 恢复是「带记忆的重新评估」：计数器、成本、预算都保留（engine 维护），
 //! 这里只负责把状态拨回一个合理的阶段态，下一 tick router 会按最新盘面重判。
 
+use crate::PhaseStrategy;
 use crate::config::StrategyConfig;
-use crate::context::{Decision, DecisionContext, PhaseStrategy};
+use crate::context::{Decision, DecisionContext};
 use crate::router::circuit_should_trip;
 use domain::state::RobotState;
+use domain::types::Qty;
 
 /// 熔断求生态小策略。
 #[derive(Debug, Clone)]
@@ -26,10 +28,9 @@ impl CircuitBreakerStrategy {
     /// 恢复后该回到哪个阶段态。
     ///
     /// 带记忆重评：有持仓就回配对态（router 下一 tick 会按 pnl 决定是否再进对冲），
-    /// 无持仓回建仓态重新铺。计数器已在 engine 侧保留，这里不重置。
+    /// 无持仓回建仓态重新铺。
     fn recovery_target(ctx: &DecisionContext) -> RobotState {
-        let has_position = ctx.position.up_qty > domain::types::Qty::ZERO
-            || ctx.position.down_qty > domain::types::Qty::ZERO;
+        let has_position = ctx.position.up_qty > Qty::ZERO || ctx.position.down_qty > Qty::ZERO;
         if has_position {
             RobotState::Pairing
         } else {
@@ -132,6 +133,9 @@ mod tests {
                 },
                 active_orders: NO_ORDERS,
                 last_hedge_at: None,
+                funds_exhausted: false,
+                double_negative_count: 0,
+                was_double_negative: false,
                 calm_since: self.calm_since,
                 constraints: OrderConstraints::default(),
             }
@@ -145,10 +149,9 @@ mod tests {
     #[test]
     fn stays_when_spread_still_wide() {
         let mut b = Builder::new();
-        // Down spread 爆宽。
         b.market = MarketSnapshot {
             up: book(dec!(0.40), dec!(0.41)),
-            down: book(dec!(0.20), dec!(0.55)),
+            down: book(dec!(0.20), dec!(0.55)), // Down spread 爆宽。
         };
         b.calm_since = None;
         assert!(strat().decide(&b.build()).is_skip());

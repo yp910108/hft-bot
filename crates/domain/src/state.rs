@@ -18,11 +18,13 @@ pub enum RobotState {
     Building,
     /// 配对态：首笔成交后常驻，主战场成交触发配对重算。
     Pairing,
-    /// 动态对冲态：Maker 织网补少仓侧摽齐（Delta Neutral）。携带「双边负」计数。
+    /// 动态对冲态：Maker 织网补少仓侧摽齐（Delta Neutral）。
     ///
+    /// 无载荷的干净状态。「双边负」边沿计数等跨阶段风险量提升为全局上下文，由 engine 统一维护
+    /// （见 strategy::context），不再塞进状态载荷——避免每个转移点手工搬运易漏。
     /// 观察（pnl 在安全区间、或敞口撞红线、或资金耗尽）时留在本状态、策略层 Skip，
     /// 不再单独设 Observing 状态——和 EV 装死、做市挂机的模式统一。
-    DynamicHedge { double_negative_count: u8 },
+    DynamicHedge,
     /// EV 对冲态：IOC Taker 顺势单边押注（战略翻转）。
     EvHedge,
     /// 熔断求生态：Spread 崩溃，CancelAll 后等流动性恢复重走全局路由。
@@ -32,16 +34,6 @@ pub enum RobotState {
 }
 
 impl RobotState {
-    /// 取动态对冲态携带的双边负计数；其他状态为 0。
-    pub fn double_negative_count(self) -> u8 {
-        match self {
-            RobotState::DynamicHedge {
-                double_negative_count,
-            } => double_negative_count,
-            _ => 0,
-        }
-    }
-
     /// 是否为终态（不再有任何出边）。
     pub fn is_terminal(self) -> bool {
         matches!(self, RobotState::SettlementWait)
@@ -58,22 +50,10 @@ mod tests {
     }
 
     #[test]
-    fn double_negative_count_extracted_from_dynamic_hedge() {
-        assert_eq!(
-            RobotState::DynamicHedge {
-                double_negative_count: 1
-            }
-            .double_negative_count(),
-            1
-        );
-        assert_eq!(RobotState::Building.double_negative_count(), 0);
-        assert_eq!(RobotState::EvHedge.double_negative_count(), 0);
-    }
-
-    #[test]
     fn only_settlement_wait_is_terminal() {
         assert!(RobotState::SettlementWait.is_terminal());
         assert!(!RobotState::Building.is_terminal());
+        assert!(!RobotState::DynamicHedge.is_terminal());
         assert!(!RobotState::EvHedge.is_terminal());
         assert!(!RobotState::CircuitBreaker.is_terminal());
     }

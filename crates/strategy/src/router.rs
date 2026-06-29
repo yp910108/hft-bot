@@ -1,10 +1,10 @@
-//! 全局条件路由：策略说明书「Global Evaluation Router」的代码化身。
+//! 全局条件路由：策略文档「Global Evaluation Router」的代码化身。
 //!
 //! 每个 tick 先过优先级链，从高到低裁决当前归谁管：
 //! ```text
-//! 时间红线(<1min) > 熔断求生(Spread>30%) > EV对冲 > 动态对冲/观察 > 建仓/配对
+//! 时间红线(<1min) > 熔断求生(Spread>30%) > 尾盘规则(TTE<5min) > EV对冲 > 动态对冲 > 核心做市
 //! ```
-//! 高优先级的全局条件（时间红线、熔断）无条件压制当前阶段；都不触发时，
+//! 高优先级的全局条件（时间红线、熔断、尾盘）无条件压制当前阶段；都不触发时，
 //! 才把控制权交给当前状态对应的阶段小策略。
 //!
 //! 路由产出的是「该调用哪个小策略」的判定 + 全局态的直接决策。
@@ -14,12 +14,13 @@ use crate::config::StrategyConfig;
 use crate::context::{CommandIntent, Decision, DecisionContext};
 use domain::market::MarketSnapshot;
 use domain::state::RobotState;
-use domain::types::Side;
+use domain::types::{Price, Side};
+use rust_decimal::Decimal;
 
 /// 路由裁决：要么是某个全局态的直接决策，要么指派给某个阶段小策略。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Route {
-    /// 全局条件命中，直接给出决策（时间红线 / 进熔断）。
+    /// 全局条件命中，直接给出决策（时间红线 / 进熔断 / 尾盘规则）。
     Direct(Decision),
     /// 交给当前阶段对应的小策略处理。
     Phase(Phase),
@@ -31,17 +32,15 @@ pub enum Phase {
     Building,
     Pairing,
     DynamicHedge,
-    Observing,
     EvHedge,
-    /// 熔断求生态：在熔断里等恢复。
     CircuitBreaker,
 }
 
 /// 计算某侧的买卖价差率 = (best_ask − best_bid) / best_bid。缺价或 bid≤0 返回 None。
-pub fn spread_ratio(market: &MarketSnapshot, side: Side) -> Option<domain::types::Price> {
+pub fn spread_ratio(market: &MarketSnapshot, side: Side) -> Option<Price> {
     let book = market.book(side);
     match (book.best_bid, book.best_ask) {
-        (Some(bid), Some(ask)) if bid > domain::types::Price::ZERO => Some((ask - bid) / bid),
+        (Some(bid), Some(ask)) if bid > Price::ZERO => Some((ask - bid) / bid),
         _ => None,
     }
 }
@@ -53,6 +52,18 @@ pub fn circuit_should_trip(market: &MarketSnapshot, cfg: &StrategyConfig) -> boo
     })
 }
 
+/// 尾盘规则判定：亏损大侧「结算 pnl × 该侧概率」是否 ≤ 亏损触发线。
+///
+/// 满足时应进 EV（由 router 直接产出 Decision），不满足则收手扛结算。
+fn tail_end_breach(ctx: &DecisionContext, cfg: &StrategyConfig) -> bool {
+    let loss = cfg.loss_trigger * ctx.total_capital;
+    // 找亏损大侧（结算 pnl 更小的那侧）。
+    let weaker = ctx.position.weaker_side().unwrap_or(Side::Up);
+    let prob = ctx.market.mark_price(weaker).unwrap_or(Decimal::ONE);
+    let weighted = ctx.position.settle_pnl(weaker) * prob;
+    weighted <= loss
+}
+
 /// 优先级链路由。返回当前 tick 的裁决。
 pub fn route(ctx: &DecisionContext, cfg: &StrategyConfig) -> Route {
     // 终态：已在等待结算，什么都不做。
@@ -60,7 +71,7 @@ pub fn route(ctx: &DecisionContext, cfg: &StrategyConfig) -> Route {
         return Route::Direct(Decision::skip());
     }
 
-    // 第 1 优先级：时间红线。剩余 < 1min，无条件 CancelAll 锁结算。
+    // 第 1 优先级：时间红线。TTE < 1min，无条件 CancelAll 锁结算。
     if ctx.time_to_expiry < cfg.time_red_line {
         return Route::Direct(
             Decision::skip()
@@ -82,24 +93,39 @@ pub fn route(ctx: &DecisionContext, cfg: &StrategyConfig) -> Route {
         );
     }
 
-    // 第 3~5 优先级：交给当前状态对应的阶段小策略。
+    // 第 3 优先级：全局尾盘规则（TTE < 5min）。
+    // 做市态和动态对冲态共用：亏损破线进 EV，否则收手扛结算。
+    // 已在 EV 态则交给 EV 小策略继续处理，不重复裁决。
+    if ctx.time_to_expiry < cfg.last_phase_window && ctx.state != RobotState::EvHedge {
+        if tail_end_breach(ctx, cfg) {
+            return Route::Direct(
+                Decision::skip()
+                    .with(CommandIntent::CancelAll)
+                    .moving_to(RobotState::EvHedge),
+            );
+        }
+        return Route::Direct(
+            Decision::skip()
+                .with(CommandIntent::CancelAll)
+                .moving_to(RobotState::SettlementWait),
+        );
+    }
+
+    // 第 4~5 优先级：交给当前状态对应的阶段小策略。
     match ctx.state {
         RobotState::Building => Route::Phase(Phase::Building),
         RobotState::Pairing => Route::Phase(Phase::Pairing),
-        RobotState::DynamicHedge { .. } => Route::Phase(Phase::DynamicHedge),
-        RobotState::Observing { .. } => Route::Phase(Phase::Observing),
+        RobotState::DynamicHedge => Route::Phase(Phase::DynamicHedge),
         RobotState::EvHedge => Route::Phase(Phase::EvHedge),
         // CircuitBreaker 已在上面处理，SettlementWait 已在最前返回。
-        RobotState::CircuitBreaker | RobotState::SettlementWait => {
-            Route::Direct(Decision::skip())
-        }
+        RobotState::CircuitBreaker | RobotState::SettlementWait => Route::Direct(Decision::skip()),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::PoolBudgets;
+    use crate::context::{PoolBudgets, Trigger};
     use domain::market::BookTop;
     use domain::order::OrderConstraints;
     use domain::pnl::PositionSnapshot;
@@ -108,7 +134,7 @@ mod tests {
     fn ctx_with(state: RobotState, tte: u64, market: MarketSnapshot) -> DecisionContext<'static> {
         DecisionContext {
             total_capital: dec!(1000),
-            trigger: crate::context::Trigger::BookUpdate,
+            trigger: Trigger::BookUpdate,
             now: 0,
             time_to_expiry: tte,
             state,
@@ -130,6 +156,9 @@ mod tests {
             },
             active_orders: &[],
             last_hedge_at: None,
+            funds_exhausted: false,
+            double_negative_count: 0,
+            was_double_negative: false,
             calm_since: None,
             constraints: OrderConstraints::default(),
         }
@@ -143,10 +172,7 @@ mod tests {
         }
     }
 
-    use domain::types::Price;
-
     fn healthy_market() -> MarketSnapshot {
-        // 双边正常窄 spread。
         MarketSnapshot {
             up: book(dec!(0.40), dec!(0.41)),
             down: book(dec!(0.59), dec!(0.60)),
@@ -164,7 +190,7 @@ mod tests {
 
     #[test]
     fn time_red_line_overrides_everything() {
-        // 剩余 30s < 1min，即便在 EV 对冲也强制收手。
+        // TTE 30s < 1min，即便在 EV 对冲也强制收手。
         let r = route(
             &ctx_with(RobotState::EvHedge, 30_000, healthy_market()),
             &StrategyConfig::default(),
@@ -216,22 +242,72 @@ mod tests {
     }
 
     #[test]
+    fn tail_end_rule_enters_ev_when_breach() {
+        // TTE 200s（<5min），且亏损大侧加权穿线。
+        let mut ctx = ctx_with(RobotState::Pairing, 200_000, healthy_market());
+        // Up 持仓 100，总成本 150 → up_settle = 100-150 = -50。mark 0.405 → -50*0.405=-20.25 ≤ -20。
+        ctx.position = PositionSnapshot {
+            up_qty: dec!(100),
+            down_qty: dec!(0),
+            up_cost: dec!(150),
+            down_cost: dec!(0),
+        };
+        let r = route(&ctx, &StrategyConfig::default());
+        match r {
+            Route::Direct(d) => {
+                assert!(d.commands.contains(&CommandIntent::CancelAll));
+                assert_eq!(d.transition, Some(RobotState::EvHedge));
+            }
+            _ => panic!("尾盘亏损破线应进 EV"),
+        }
+    }
+
+    #[test]
+    fn tail_end_rule_settles_when_no_breach() {
+        // TTE 200s（<5min），但没穿线 → 收手扛结算。
+        let ctx = ctx_with(RobotState::Pairing, 200_000, healthy_market());
+        // 默认持仓全 0，settle pnl = 0，不穿线。
+        let r = route(&ctx, &StrategyConfig::default());
+        match r {
+            Route::Direct(d) => {
+                assert!(d.commands.contains(&CommandIntent::CancelAll));
+                assert_eq!(d.transition, Some(RobotState::SettlementWait));
+            }
+            _ => panic!("尾盘未破线应收手扛结算"),
+        }
+    }
+
+    #[test]
+    fn tail_end_does_not_affect_ev_state() {
+        // 已在 EV 态，TTE<5min → 尾盘规则不重复裁决，交给 EV 小策略。
+        let r = route(
+            &ctx_with(RobotState::EvHedge, 200_000, healthy_market()),
+            &StrategyConfig::default(),
+        );
+        assert_eq!(r, Route::Phase(Phase::EvHedge));
+    }
+
+    #[test]
     fn healthy_market_routes_to_current_phase() {
         let cfg = StrategyConfig::default();
         assert_eq!(
-            route(&ctx_with(RobotState::Building, 600_000, healthy_market()), &cfg),
+            route(
+                &ctx_with(RobotState::Building, 600_000, healthy_market()),
+                &cfg
+            ),
             Route::Phase(Phase::Building)
         );
         assert_eq!(
-            route(&ctx_with(RobotState::Pairing, 600_000, healthy_market()), &cfg),
+            route(
+                &ctx_with(RobotState::Pairing, 600_000, healthy_market()),
+                &cfg
+            ),
             Route::Phase(Phase::Pairing)
         );
         assert_eq!(
             route(
                 &ctx_with(
-                    RobotState::DynamicHedge {
-                        double_negative_count: 0
-                    },
+                    RobotState::DynamicHedge,
                     600_000,
                     healthy_market()
                 ),
@@ -240,7 +316,10 @@ mod tests {
             Route::Phase(Phase::DynamicHedge)
         );
         assert_eq!(
-            route(&ctx_with(RobotState::EvHedge, 600_000, healthy_market()), &cfg),
+            route(
+                &ctx_with(RobotState::EvHedge, 600_000, healthy_market()),
+                &cfg
+            ),
             Route::Phase(Phase::EvHedge)
         );
     }

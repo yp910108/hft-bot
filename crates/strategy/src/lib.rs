@@ -13,10 +13,15 @@ pub mod ev_hedge;
 pub mod pairing;
 pub mod router;
 
+/// 一个阶段小策略：给定只读世界快照，算出此刻的决策。纯函数，无副作用。
+pub trait PhaseStrategy {
+    fn decide(&self, ctx: &context::DecisionContext) -> context::Decision;
+}
+
 pub use building::BuildingStrategy;
 pub use circuit_breaker::CircuitBreakerStrategy;
 pub use config::StrategyConfig;
-pub use context::{Decision, DecisionContext, PhaseStrategy};
+pub use context::{Decision, DecisionContext};
 pub use dynamic_hedge::DynamicHedgeStrategy;
 pub use ev_hedge::EvHedgeStrategy;
 pub use pairing::PairingStrategy;

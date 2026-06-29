@@ -7,12 +7,27 @@
 //! 订单意图 [`OrderIntent`] 不带 order_id 与 generation：那是 engine 的职责
 //! （下发时分配），strategy 只表达「想在某侧某价挂多少、什么角色、什么有效期」。
 
+use domain::clock::Millis;
 use domain::market::MarketSnapshot;
 use domain::order::{OrderConstraints, OrderDirection, OrderId, TimeInForce};
 use domain::pnl::PositionSnapshot;
 use domain::state::RobotState;
 use domain::types::{Money, OrderRole, Price, Qty, Side};
-use exchange::clock::Millis;
+
+// ─────────────────────────── Trigger ───────────────────────────
+
+/// 本次 tick 由什么事件触发。小策略据此决定反应（尤其配对态要区分成交来自哪侧）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Trigger {
+    /// 盘口更新。
+    BookUpdate,
+    /// 某侧某笔成交。`side` 是成交侧。
+    Fill { side: Side },
+    /// 撤单确认 / 撤单失败（订单簿镜像已由 engine 更新）。
+    OrderUpdate,
+}
+
+// ─────────────────────────── ActiveOrder ───────────────────────────
 
 /// 一笔活跃挂单的只读视图（engine 维护，喂给 strategy 做精细订单管理）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +46,8 @@ impl ActiveOrder {
         self.price * self.qty
     }
 }
+
+// ─────────────────────────── PoolBudgets ───────────────────────────
 
 /// 各资金池的额度（engine 跨阶段追踪，花完即停）。
 ///
@@ -51,22 +68,12 @@ pub struct PoolBudgets {
     pub max_exposure: Money,
 }
 
-/// 本次 tick 由什么事件触发。小策略据此决定反应（尤其配对态要区分成交来自哪侧）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Trigger {
-    /// 盘口更新。
-    BookUpdate,
-    /// 某侧某笔成交。`side` 是成交侧。
-    Fill { side: Side },
-    /// 撤单确认 / 撤单失败（订单簿镜像已由 engine 更新）。
-    OrderUpdate,
-    /// 单步生命周期定时器到期（对冲超时兜底）。
-    TimerFired,
-}
+// ─────────────────────────── DecisionContext ───────────────────────────
 
 /// 只读世界切片：strategy 做决策需要的全部信息。
 #[derive(Debug, Clone)]
 pub struct DecisionContext<'a> {
+    // ─── 瞬时快照：每 tick 由 engine 重新组装，反映当前世界 ───
     /// 总资金 V，阈值（%V）换算用。
     pub total_capital: Money,
     /// 本次 tick 的触发事件。
@@ -75,12 +82,6 @@ pub struct DecisionContext<'a> {
     pub now: Millis,
     /// 剩余时间（到交割还有多少毫秒）。
     pub time_to_expiry: Millis,
-    /// 当前状态。
-    pub state: RobotState,
-    /// 主战场侧（建仓时锁定，一轮不换）。建仓前为 None。
-    pub main_field: Option<Side>,
-    /// 主战场侧是否已永久停铺（敞口曾超限，做市态本场不再铺）。
-    pub main_field_frozen: bool,
     /// 持仓快照（按侧股数与成本）。
     pub position: PositionSnapshot,
     /// 当前盘口。
@@ -89,13 +90,27 @@ pub struct DecisionContext<'a> {
     pub pools: PoolBudgets,
     /// 当前活跃挂单（engine 维护的本地镜像）。
     pub active_orders: &'a [ActiveOrder],
-    /// 上次对冲动作的时间戳（冷却判定用）。从未对冲为 None。
-    pub last_hedge_at: Option<Millis>,
-    /// 熔断态下，spread 持续低于恢复阈值的起始时刻；一旦 spread 再次爆宽就清空。
-    /// engine 维护：用于判定「稳定 5 秒」。非熔断态或尚未平静为 None。
-    pub calm_since: Option<Millis>,
     /// 下单量/价精度与最小量约束。
     pub constraints: OrderConstraints,
+
+    // ─── 跨阶段可变状态：engine 持久维护、跨 tick/跨阶段记忆，strategy 只读 ───
+    //     （选项 2/3 待重写 engine 时收拢成独立 RoundState 结构 + 统一更新意图表达）
+    /// 当前 FSM 状态。
+    pub state: RobotState,
+    /// 主战场侧（建仓时锁定，一轮不换）。建仓前为 None。
+    pub main_field: Option<Side>,
+    /// 主战场侧是否已永久停铺（做市阶段敞口曾超限，本阶段不再铺）。
+    pub main_field_frozen: bool,
+    /// 上次对冲动作的时间戳（冷却判定用）。从未对冲为 None。
+    pub last_hedge_at: Option<Millis>,
+    /// 资金耗尽标志位：动态对冲池资金耗尽后置 true，黏住本场不再重启对冲。
+    pub funds_exhausted: bool,
+    /// 「双边负」边沿计数（跨阶段全局量，engine 统一维护）。
+    pub double_negative_count: u8,
+    /// 上一 tick 是否处于双边负状态（边沿检测用，engine 维护）。
+    pub was_double_negative: bool,
+    /// 熔断态下 spread 持续低于恢复阈值的起始时刻；尚未平静为 None。engine 维护。
+    pub calm_since: Option<Millis>,
 }
 
 impl DecisionContext<'_> {
@@ -112,23 +127,24 @@ impl DecisionContext<'_> {
             .map(|o| o.notional())
             .sum()
     }
+
+    /// 是否在冷却中：距上次对冲动作不足 `cooldown` 毫秒。从未对冲则不在冷却。
+    pub fn in_cooldown(&self, cooldown: Millis) -> bool {
+        match self.last_hedge_at {
+            Some(last) => self.now < last + cooldown,
+            None => false,
+        }
+    }
+
+    /// 某侧某价位是否已有活跃挂单（价位防重检测，防重复铺单）。
+    pub fn has_active_order_at(&self, side: Side, price: Price) -> bool {
+        self.active_orders
+            .iter()
+            .any(|o| o.side == side && o.price == price)
+    }
 }
 
-/// strategy 想让 engine 执行的一条指令意图。
-///
-/// 与 `domain::Command` 的区别：Submit 携带的是 [`OrderIntent`]（无 ID/世代），
-/// engine 落地时再补全。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CommandIntent {
-    /// 提交一笔新挂单。
-    Submit(OrderIntent),
-    /// 撤销指定订单。
-    Cancel(OrderId),
-    /// 撤销某侧全部活跃挂单。
-    CancelSide(Side),
-    /// 撤销所有活跃挂单。
-    CancelAll,
-}
+// ─────────────────────────── OrderIntent / CommandIntent ───────────────────────────
 
 /// 一笔订单意图：strategy 表达「想挂什么」，不含 engine 才知道的 ID 与世代。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,13 +183,31 @@ impl OrderIntent {
     }
 }
 
-/// strategy 的决策结果：要发的指令 + 可选的阶段跳转。
+/// strategy 想让 engine 执行的一条指令意图。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandIntent {
+    /// 提交一笔新挂单。
+    Submit(OrderIntent),
+    /// 撤销指定订单。
+    Cancel(OrderId),
+    /// 撤销某侧全部活跃挂单。
+    CancelSide(Side),
+    /// 撤销所有活跃挂单。
+    CancelAll,
+}
+
+// ─────────────────────────── Decision ───────────────────────────
+
+/// strategy 的决策结果：要发的指令 + 可选的阶段跳转 + 全局量更新意图。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Decision {
     /// 本次要执行的指令意图，按顺序下发。
     pub commands: Vec<CommandIntent>,
     /// 请求跳转到的新状态。None 表示留在当前状态。
     pub transition: Option<RobotState>,
+    /// 双边负边沿计数更新意图：strategy 算出的最新 (count, was_double_negative)。
+    /// None 表示本 tick 不需要更新（非动态对冲阶段不关心）。engine 收到 Some 就写入。
+    pub double_negative_update: Option<(u8, bool)>,
 }
 
 impl Decision {
@@ -187,6 +221,7 @@ impl Decision {
         Self {
             commands: Vec::new(),
             transition: Some(to),
+            double_negative_update: None,
         }
     }
 
@@ -202,16 +237,19 @@ impl Decision {
         self
     }
 
+    /// 设置双边负计数更新意图，链式调用。
+    pub fn with_dn_update(mut self, count: u8, was: bool) -> Self {
+        self.double_negative_update = Some((count, was));
+        self
+    }
+
     /// 是否什么都不做（无指令无跳转）。
     pub fn is_skip(&self) -> bool {
         self.commands.is_empty() && self.transition.is_none()
     }
 }
 
-/// 一个阶段小策略：给定只读世界快照，算出此刻的决策。纯函数，无副作用。
-pub trait PhaseStrategy {
-    fn decide(&self, ctx: &DecisionContext) -> Decision;
-}
+// ─────────────────────────── 测试 ───────────────────────────
 
 #[cfg(test)]
 mod tests {
