@@ -52,8 +52,15 @@ impl Engine {
             self.round.update_double_negative(count, was);
         }
 
-        // 应用状态跳转。跳转时推进世代号，隔离旧世代成交不误触新阶段逻辑。
+        // 应用状态跳转。跳转前校验合法性（安全网，非法跳转在开发期暴露）。
+        // 跳转时推进世代号，隔离旧世代成交不误触新阶段逻辑。
         if let Some(target) = decision.transition {
+            debug_assert!(
+                fsm::is_legal_transition(self.round.state, target),
+                "非法状态跳转: {:?} → {:?}",
+                self.round.state,
+                target,
+            );
             self.round.state = target;
             self.generation = self.generation.next();
         }
