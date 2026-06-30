@@ -63,6 +63,11 @@ impl Engine {
             );
             self.round.state = target;
             self.generation = self.generation.next();
+            // 诊断：更新本场曾达最深阶段。
+            let depth = Self::phase_depth(target);
+            if depth > self.deepest_phase {
+                self.deepest_phase = depth;
+            }
         }
 
         commands
@@ -100,8 +105,18 @@ impl Engine {
             RobotState::Building | RobotState::Pairing => Pool::GridMaker,
             RobotState::DynamicHedge => Pool::Dynamic,
             RobotState::EvHedge => Pool::Ev,
-            // 熔断 / 结算态不发新单，给个默认。
             RobotState::CircuitBreaker | RobotState::SettlementWait => Pool::GridMaker,
+        }
+    }
+
+    /// 阶段推进深度（诊断用）：Building 0 < Pairing 1 < DynamicHedge 2 < EvHedge 3。
+    fn phase_depth(state: RobotState) -> u8 {
+        match state {
+            RobotState::Building => 0,
+            RobotState::Pairing => 1,
+            RobotState::DynamicHedge => 2,
+            RobotState::EvHedge => 3,
+            RobotState::CircuitBreaker | RobotState::SettlementWait => 0,
         }
     }
 }

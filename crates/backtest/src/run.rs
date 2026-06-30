@@ -5,13 +5,13 @@
 //! ④ Engine 产出的指令下发给 Simulator。结算：按胜方每股 1 美元兑付，减去总成本。
 
 use crate::market::Market;
+use domain::clock::Millis;
+use domain::command::Command;
 use domain::fee::FeeModel;
-use domain::order::Command;
 use domain::state::RobotState;
 use domain::types::{Money, Side};
 use engine::{Engine, EngineConfig};
 use exchange::backend::ExchangeBackend;
-use exchange::clock::Millis;
 use exchange::event::ExchangeEvent;
 use exchange::simulator::Simulator;
 use rust_decimal::Decimal;
@@ -122,7 +122,6 @@ pub fn run_match_recorded(
     };
     (result, records)
 }
-
 
 /// 跑一整场回测。
 pub fn run_match(market: &Market, total_capital: Money, fee: FeeModel) -> MatchResult {
@@ -236,8 +235,7 @@ mod tests {
             RobotState::Building
                 | RobotState::Pairing
                 | RobotState::SettlementWait
-                | RobotState::DynamicHedge { .. }
-                | RobotState::Observing { .. }
+                | RobotState::DynamicHedge
                 | RobotState::EvHedge
                 | RobotState::CircuitBreaker
         ));

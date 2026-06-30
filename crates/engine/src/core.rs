@@ -52,6 +52,9 @@ pub struct Engine {
 
     pub(crate) now: Millis,
     pub(crate) time_to_expiry: Millis,
+
+    // 诊断：本场曾到达的最深阶段（回测分析用）。
+    pub(crate) deepest_phase: u8,
 }
 
 impl Engine {
@@ -76,6 +79,7 @@ impl Engine {
             order_pool: HashMap::new(),
             now: 0,
             time_to_expiry: 0,
+            deepest_phase: 0,
         }
     }
 
@@ -92,6 +96,17 @@ impl Engine {
     /// 主战场侧（建仓首笔成交后锁定）。
     pub fn main_field(&self) -> Option<Side> {
         self.round.main_field
+    }
+
+    /// 本场曾到达的最深阶段标签（回测诊断用）。
+    pub fn deepest_phase_label(&self) -> &'static str {
+        match self.deepest_phase {
+            0 => "Building",
+            1 => "Pairing",
+            2 => "DynamicHedge",
+            3 => "EvHedge",
+            _ => "Unknown",
+        }
     }
 
     /// 处理一个事件。`now` 与 `time_to_expiry` 由调用方（时钟）给出。
