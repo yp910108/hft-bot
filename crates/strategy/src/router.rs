@@ -67,7 +67,7 @@ fn tail_end_breach(ctx: &DecisionContext, cfg: &StrategyConfig) -> bool {
 /// 优先级链路由。返回当前 tick 的裁决。
 pub fn route(ctx: &DecisionContext, cfg: &StrategyConfig) -> Route {
     // 终态：已在等待结算，什么都不做。
-    if ctx.state == RobotState::SettlementWait {
+    if ctx.round.state == RobotState::SettlementWait {
         return Route::Direct(Decision::skip());
     }
 
@@ -82,7 +82,7 @@ pub fn route(ctx: &DecisionContext, cfg: &StrategyConfig) -> Route {
 
     // 第 2 优先级：熔断。任一侧 spread 崩溃。
     // 已在熔断态则交给熔断小策略处理恢复；否则触发进入熔断。
-    if ctx.state == RobotState::CircuitBreaker {
+    if ctx.round.state == RobotState::CircuitBreaker {
         return Route::Phase(Phase::CircuitBreaker);
     }
     if circuit_should_trip(&ctx.market, cfg) {
@@ -96,7 +96,7 @@ pub fn route(ctx: &DecisionContext, cfg: &StrategyConfig) -> Route {
     // 第 3 优先级：全局尾盘规则（TTE < 5min）。
     // 做市态和动态对冲态共用：亏损破线进 EV，否则收手扛结算。
     // 已在 EV 态则交给 EV 小策略继续处理，不重复裁决。
-    if ctx.time_to_expiry < cfg.last_phase_window && ctx.state != RobotState::EvHedge {
+    if ctx.time_to_expiry < cfg.last_phase_window && ctx.round.state != RobotState::EvHedge {
         if tail_end_breach(ctx, cfg) {
             return Route::Direct(
                 Decision::skip()
@@ -112,7 +112,7 @@ pub fn route(ctx: &DecisionContext, cfg: &StrategyConfig) -> Route {
     }
 
     // 第 4~5 优先级：交给当前状态对应的阶段小策略。
-    match ctx.state {
+    match ctx.round.state {
         RobotState::Building => Route::Phase(Phase::Building),
         RobotState::Pairing => Route::Phase(Phase::Pairing),
         RobotState::DynamicHedge => Route::Phase(Phase::DynamicHedge),
@@ -129,17 +129,20 @@ mod tests {
     use domain::market::BookTop;
     use domain::order::OrderConstraints;
     use domain::pnl::PositionSnapshot;
+    use domain::round_state::RoundState;
     use rust_decimal_macros::dec;
 
     fn ctx_with(state: RobotState, tte: u64, market: MarketSnapshot) -> DecisionContext<'static> {
+        let mut round = RoundState::new();
+        round.state = state;
+        round.main_field = Some(Side::Up);
+        // Leak for 'static lifetime in tests (tiny, never freed, acceptable in test code).
+        let round_ref: &'static RoundState = Box::leak(Box::new(round));
         DecisionContext {
             total_capital: dec!(1000),
             trigger: Trigger::BookUpdate,
             now: 0,
             time_to_expiry: tte,
-            state,
-            main_field: Some(Side::Up),
-            main_field_frozen: false,
             position: PositionSnapshot {
                 up_qty: dec!(0),
                 down_qty: dec!(0),
@@ -155,12 +158,8 @@ mod tests {
                 max_exposure: dec!(112.5),
             },
             active_orders: &[],
-            last_hedge_at: None,
-            funds_exhausted: false,
-            double_negative_count: 0,
-            was_double_negative: false,
-            calm_since: None,
             constraints: OrderConstraints::default(),
+            round: round_ref,
         }
     }
 
@@ -306,11 +305,7 @@ mod tests {
         );
         assert_eq!(
             route(
-                &ctx_with(
-                    RobotState::DynamicHedge,
-                    600_000,
-                    healthy_market()
-                ),
+                &ctx_with(RobotState::DynamicHedge, 600_000, healthy_market()),
                 &cfg
             ),
             Route::Phase(Phase::DynamicHedge)

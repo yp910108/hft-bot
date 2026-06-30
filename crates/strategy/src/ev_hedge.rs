@@ -110,6 +110,8 @@ mod tests {
     use domain::market::{BookTop, MarketSnapshot};
     use domain::order::OrderConstraints;
     use domain::pnl::PositionSnapshot;
+    use domain::round_state::RoundState;
+    use domain::state::RobotState;
     use domain::types::OrderRole;
     use rust_decimal_macros::dec;
 
@@ -125,28 +127,29 @@ mod tests {
         position: PositionSnapshot,
         market: MarketSnapshot,
         now: u64,
-        last_hedge_at: Option<u64>,
         ev_remaining: Decimal,
+        round_state: RoundState,
     }
 
     impl Builder {
         fn new() -> Self {
+            let mut round = RoundState::new();
+            round.state = RobotState::EvHedge;
+            round.main_field = Some(Side::Up);
             Self {
-                // 双边都负的灾难态（进 EV 的前提）：Up 40/Down 50，成本 100。
                 position: PositionSnapshot {
                     up_qty: dec!(40),
                     down_qty: dec!(50),
                     up_cost: dec!(50),
                     down_cost: dec!(50),
                 },
-                // Down 优势方，概率 0.80（在甜区 [0.75, 0.85] 内）。
                 market: MarketSnapshot {
                     up: book(dec!(0.19), dec!(0.21)),
                     down: book(dec!(0.79), dec!(0.81)),
                 },
                 now: 10_000,
-                last_hedge_at: None,
                 ev_remaining: dec!(375),
+                round_state: round,
             }
         }
 
@@ -156,10 +159,7 @@ mod tests {
                 total_capital: dec!(1000),
                 trigger: Trigger::BookUpdate,
                 now: self.now,
-                time_to_expiry: 200_000, // 在 EV 窗口内（< 5min）。
-                state: RobotState::EvHedge,
-                main_field: Some(Side::Up),
-                main_field_frozen: false,
+                time_to_expiry: 200_000,
                 position: self.position,
                 market: self.market,
                 pools: PoolBudgets {
@@ -170,12 +170,8 @@ mod tests {
                     max_exposure: dec!(112.5),
                 },
                 active_orders: NO_ORDERS,
-                last_hedge_at: self.last_hedge_at,
-                funds_exhausted: false,
-                double_negative_count: 0,
-                was_double_negative: false,
-                calm_since: None,
                 constraints: OrderConstraints::default(),
+                round: &self.round_state,
             }
         }
     }
@@ -254,7 +250,7 @@ mod tests {
     #[test]
     fn cooldown_blocks_fire() {
         let mut b = Builder::new();
-        b.last_hedge_at = Some(9_000);
+        b.round_state.last_hedge_at = Some(9_000);
         b.now = 10_000; // 距上次 1000 < 2000 冷却 → 装死。
         let d = strat().decide(&b.build());
         assert!(d.is_skip());
@@ -287,7 +283,7 @@ mod tests {
         // 场景：EV 池有钱（375），但盘口 best_ask = None（闪空）→ 不应误判资金耗尽。
         let mut b = Builder::new();
         b.market = MarketSnapshot {
-            up: BookTop::default(),                          // 盘口闪空
+            up: BookTop::default(), // 盘口闪空
             down: BookTop::default(),
         };
         let d = strat().decide(&b.build());
@@ -307,7 +303,11 @@ mod tests {
         };
         let d = strat().decide(&b.build());
         // 不开火（装死），不触发冷却。
-        assert!(!d.commands.iter().any(|c| matches!(c, CommandIntent::Submit(_))));
+        assert!(
+            !d.commands
+                .iter()
+                .any(|c| matches!(c, CommandIntent::Submit(_)))
+        );
         assert!(d.is_skip());
     }
 }

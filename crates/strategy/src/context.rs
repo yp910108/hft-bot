@@ -11,6 +11,7 @@ use domain::clock::Millis;
 use domain::market::MarketSnapshot;
 use domain::order::{OrderConstraints, OrderDirection, OrderId, TimeInForce};
 use domain::pnl::PositionSnapshot;
+use domain::round_state::RoundState;
 use domain::state::RobotState;
 use domain::types::{Money, OrderRole, Price, Qty, Side};
 
@@ -93,24 +94,9 @@ pub struct DecisionContext<'a> {
     /// 下单量/价精度与最小量约束。
     pub constraints: OrderConstraints,
 
-    // ─── 跨阶段可变状态：engine 持久维护、跨 tick/跨阶段记忆，strategy 只读 ───
-    //     （选项 2/3 待重写 engine 时收拢成独立 RoundState 结构 + 统一更新意图表达）
-    /// 当前 FSM 状态。
-    pub state: RobotState,
-    /// 主战场侧（建仓时锁定，一轮不换）。建仓前为 None。
-    pub main_field: Option<Side>,
-    /// 主战场侧是否已永久停铺（做市阶段敞口曾超限，本阶段不再铺）。
-    pub main_field_frozen: bool,
-    /// 上次对冲动作的时间戳（冷却判定用）。从未对冲为 None。
-    pub last_hedge_at: Option<Millis>,
-    /// 资金耗尽标志位：动态对冲池资金耗尽后置 true，黏住本场不再重启对冲。
-    pub funds_exhausted: bool,
-    /// 「双边负」边沿计数（跨阶段全局量，engine 统一维护）。
-    pub double_negative_count: u8,
-    /// 上一 tick 是否处于双边负状态（边沿检测用，engine 维护）。
-    pub was_double_negative: bool,
-    /// 熔断态下 spread 持续低于恢复阈值的起始时刻；尚未平静为 None。engine 维护。
-    pub calm_since: Option<Millis>,
+    // ─── 跨阶段可变状态：engine 持有 RoundState，这里是只读引用 ───
+    /// 跨阶段可变状态（engine 持久维护，strategy 只读）。
+    pub round: &'a RoundState,
 }
 
 impl DecisionContext<'_> {
@@ -130,7 +116,7 @@ impl DecisionContext<'_> {
 
     /// 是否在冷却中：距上次对冲动作不足 `cooldown` 毫秒。从未对冲则不在冷却。
     pub fn in_cooldown(&self, cooldown: Millis) -> bool {
-        match self.last_hedge_at {
+        match self.round.last_hedge_at {
             Some(last) => self.now < last + cooldown,
             None => false,
         }
@@ -208,6 +194,10 @@ pub struct Decision {
     /// 双边负边沿计数更新意图：strategy 算出的最新 (count, was_double_negative)。
     /// None 表示本 tick 不需要更新（非动态对冲阶段不关心）。engine 收到 Some 就写入。
     pub double_negative_update: Option<(u8, bool)>,
+    /// 请求 engine 置 main_field_frozen = true（做市阶段敞口超限永久停铺）。
+    pub freeze_main_field: bool,
+    /// 请求 engine 置 funds_exhausted = true（动态对冲资金耗尽黏住）。
+    pub mark_funds_exhausted: bool,
 }
 
 impl Decision {
@@ -222,6 +212,8 @@ impl Decision {
             commands: Vec::new(),
             transition: Some(to),
             double_negative_update: None,
+            freeze_main_field: false,
+            mark_funds_exhausted: false,
         }
     }
 

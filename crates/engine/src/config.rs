@@ -1,4 +1,4 @@
-//! 引擎配置与资金池标签。
+//! 引擎配置与内部资金池标签。
 
 use domain::order::OrderConstraints;
 use domain::types::Money;
@@ -23,7 +23,7 @@ pub struct EngineConfig {
 }
 
 impl EngineConfig {
-    /// 默认配置：按默认四池比例切分给定总资金。
+    /// 默认配置：按默认四池比例切分给定总资金，Cash Guard 取备用金池比例。
     pub fn with_capital(total_capital: Money) -> Self {
         let pools = CapitalPools::with_default_ratios(total_capital);
         Self {
@@ -32,5 +32,27 @@ impl EngineConfig {
             cash_guard_ratio: pools.ratios().reserve,
             constraints: OrderConstraints::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    #[test]
+    fn with_capital_splits_four_pools() {
+        let cfg = EngineConfig::with_capital(dec!(1000));
+        // 默认四池：备用 250 / 做市 150 / 动态 225 / EV 375。
+        assert_eq!(cfg.pools.grid_maker(), dec!(150));
+        assert_eq!(cfg.pools.dynamic(), dec!(225));
+        assert_eq!(cfg.pools.ev(), dec!(375));
+    }
+
+    #[test]
+    fn cash_guard_defaults_to_reserve_ratio() {
+        let cfg = EngineConfig::with_capital(dec!(1000));
+        // Cash Guard 红线比例 = 备用金池比例 25%。
+        assert_eq!(cfg.cash_guard_ratio, dec!(0.25));
     }
 }

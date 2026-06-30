@@ -1,8 +1,8 @@
-//! 事件事实更新：把交易所事件落到本地状态（账本 / 挂单簿 / 行情），并得出触发类型。
-//!
-//! 真实状态以交易所回调为准：撤单确认/失败都从本地镜像移除该单；成交一律入账。
+//! 事件事实更新：把交易所事件落到本地状态（账本 / 挂单簿 / 行情 / calm_since），
+//! 返回本次 tick 的触发类型。
 
-use crate::Engine;
+use crate::config::Pool;
+use crate::core::Engine;
 use domain::order::Fill;
 use domain::state::RobotState;
 use domain::types::{Money, Side};
@@ -24,7 +24,6 @@ impl Engine {
                 Trigger::Fill { side: fill.side }
             }
             ExchangeEvent::Canceled(order_id) | ExchangeEvent::CancelFailed(order_id) => {
-                // 撤单确认或失败：本地镜像都移除该单（失败通常因已成交，Fill 已另行入账）。
                 self.book.remove(*order_id);
                 self.order_pool.remove(order_id);
                 Trigger::OrderUpdate
@@ -34,43 +33,62 @@ impl Engine {
                 self.order_pool.remove(order_id);
                 Trigger::OrderUpdate
             }
-            ExchangeEvent::TimerFired(_) => Trigger::TimerFired,
         }
     }
 
-    /// 记一笔成交：入账、移出挂单簿、累加所属池成本、锁定主战场。
+    /// 记一笔成交：入账、更新挂单簿、累加所属池成本、锁定主战场。
     fn book_fill(&mut self, fill: &Fill) {
         self.ledger.apply_fill(fill);
         // 首笔成交锁定主战场。
-        if self.main_field.is_none() {
-            self.main_field = Some(fill.side);
-        }
+        self.round.lock_main_field(fill.side);
         // 累加所属池的已成交成本。
         if let Some(pool) = self.order_pool.get(&fill.order_id).copied() {
             *self.filled_cost.entry(pool).or_insert(Money::ZERO) += fill.cash;
         }
-        self.book.remove(fill.order_id);
-        self.order_pool.remove(&fill.order_id);
+        // 部分成交：减少该单 qty，全部成交则移除。
+        // Polymarket Maker 单部分成交后剩余继续排队。
+        let still_resting = self.book.apply_fill(fill.order_id, fill.filled_qty);
+        if !still_resting {
+            // 全部成交或单不在簿中：清理 order_pool 映射。
+            self.order_pool.remove(&fill.order_id);
+        }
     }
 
     /// 熔断态下追踪 spread 平静起点。非熔断态清空。
     fn update_calm_tracking(&mut self) {
-        if self.machine.state() != RobotState::CircuitBreaker {
-            self.calm_since = None;
+        if self.round.state != RobotState::CircuitBreaker {
+            self.round.calm_since = None;
             return;
         }
-        let tripping = [Side::Up, Side::Down].iter().any(|&s| {
-            spread_ratio(&self.market, s)
-                .is_some_and(|r| r > self.cfg.strategy.circuit_trigger_ratio)
-        });
-        let calm = [Side::Up, Side::Down].iter().any(|&s| {
-            spread_ratio(&self.market, s)
-                .is_some_and(|r| r < self.cfg.strategy.circuit_recover_ratio)
-        });
-        if tripping || !calm {
-            self.calm_since = None;
-        } else if self.calm_since.is_none() {
-            self.calm_since = Some(self.now);
-        }
+        // 两侧 spread 都 < 恢复阈值才算平静。
+        let recover = self.cfg.strategy.circuit_recover_ratio;
+        let all_calm = [Side::Up, Side::Down]
+            .iter()
+            .all(|&s| spread_ratio(&self.market, s).is_some_and(|r| r < recover));
+        self.round.update_calm(all_calm, self.now);
+    }
+
+    /// 可用现金 = 总资金 − 已成交总成本 − 活跃挂单总名义。
+    pub(crate) fn free_cash(&self) -> Money {
+        let filled: Money = self.filled_cost.values().copied().sum();
+        let active: Money = self.book.iter().map(|o| o.price * o.qty).sum();
+        self.cfg.pools.total_capital() - filled - active
+    }
+
+    /// 当前各池剩余 = 池总额 − 已成交成本 − 活跃挂单名义。
+    pub(crate) fn pool_remaining(&self, pool: Pool) -> Money {
+        let total = match pool {
+            Pool::GridMaker => self.cfg.pools.grid_maker(),
+            Pool::Dynamic => self.cfg.pools.dynamic(),
+            Pool::Ev => self.cfg.pools.ev(),
+        };
+        let filled = self.filled_cost.get(&pool).copied().unwrap_or(Money::ZERO);
+        let active: Money = self
+            .book
+            .iter()
+            .filter(|o| self.order_pool.get(&o.order_id).copied() == Some(pool))
+            .map(|o| o.price * o.qty)
+            .sum();
+        total - filled - active
     }
 }

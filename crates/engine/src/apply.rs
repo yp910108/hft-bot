@@ -1,18 +1,20 @@
 //! 落地决策：把小策略产出的指令意图变成真实指令（分配 ID、过风控、更新镜像），
-//! 并应用状态跳转。这是 engine 唯一改挂单簿与状态机的地方。
+//! 并应用状态跳转与全局量更新。这是 engine 唯一改挂单簿、状态机、全局量的地方。
 
 use crate::config::Pool;
-use crate::Engine;
-use domain::order::{Command, Order};
+use crate::core::Engine;
+use domain::command::Command;
+use domain::order::Order;
 use domain::state::RobotState;
 use risk::auditor::Approval;
 use strategy::context::{CommandIntent, Decision, OrderIntent};
 
 impl Engine {
-    /// 落地决策：逐条指令分配 ID、过风控、产出 Command、更新镜像；最后应用状态跳转。
+    /// 落地决策：逐条指令分配 ID、过风控、产出 Command、更新镜像；
+    /// 再应用状态跳转与全局量更新。
     pub(crate) fn apply_decision(&mut self, decision: Decision) -> Vec<Command> {
         let mut commands = Vec::new();
-        let state = self.machine.state();
+        let state = self.round.state;
         let pool = Self::pool_for_state(state);
 
         for intent in &decision.commands {
@@ -28,10 +30,6 @@ impl Engine {
                 }
                 CommandIntent::CancelSide(side) => {
                     self.book.mark_side_cancel_pending(*side);
-                    // 配对态因敞口撤主战场 → 本场永久停铺。
-                    if state == RobotState::Pairing && Some(*side) == self.main_field {
-                        self.main_field_frozen = true;
-                    }
                     commands.push(Command::CancelSide(*side));
                 }
                 CommandIntent::CancelAll => {
@@ -41,14 +39,23 @@ impl Engine {
             }
         }
 
-        // 应用状态跳转。
-        if let Some(target) = decision.transition {
-            self.machine.transition_to(target);
+        // 应用显式全局量更新意图（strategy 表达、engine 无脑写入，不猜）。
+        if decision.freeze_main_field {
+            self.round.freeze_main_field();
         }
-        // 更新「曾达最深阶段」诊断。
-        let depth = Self::phase_depth(self.machine.state());
-        if depth > self.deepest_phase {
-            self.deepest_phase = depth;
+        if decision.mark_funds_exhausted {
+            self.round.mark_funds_exhausted();
+        }
+
+        // 应用双边负计数更新意图。
+        if let Some((count, was)) = decision.double_negative_update {
+            self.round.update_double_negative(count, was);
+        }
+
+        // 应用状态跳转。跳转时推进世代号，隔离旧世代成交不误触新阶段逻辑。
+        if let Some(target) = decision.transition {
+            self.round.state = target;
+            self.generation = self.generation.next();
         }
 
         commands
@@ -75,33 +82,19 @@ impl Engine {
         self.order_pool.insert(order_id, pool);
         // 对冲单记录时间戳（冷却用）。
         if matches!(pool, Pool::Dynamic | Pool::Ev) {
-            self.last_hedge_at = Some(self.now);
+            self.round.record_hedge_at(self.now);
         }
         Some(Command::SubmitOrder(order))
     }
 
-    /// 阶段推进深度（用于诊断「曾达最深阶段」）。
-    /// 建仓0 < 配对1 < 观察2 < 动态对冲3 < EV 4；熔断/结算不计深度。
-    fn phase_depth(state: RobotState) -> u8 {
+    /// 某状态下新挂单出自哪个池。
+    fn pool_for_state(state: RobotState) -> Pool {
         match state {
-            RobotState::Building => 0,
-            RobotState::Pairing => 1,
-            RobotState::Observing { .. } => 2,
-            RobotState::DynamicHedge { .. } => 3,
-            RobotState::EvHedge => 4,
-            RobotState::CircuitBreaker | RobotState::SettlementWait => 0,
-        }
-    }
-
-    /// 本场曾到达的最深阶段标签（回测诊断用）。
-    pub fn deepest_phase_label(&self) -> &'static str {
-        match self.deepest_phase {
-            0 => "Building",
-            1 => "Pairing",
-            2 => "Observing",
-            3 => "DynamicHedge",
-            4 => "EvHedge",
-            _ => "Unknown",
+            RobotState::Building | RobotState::Pairing => Pool::GridMaker,
+            RobotState::DynamicHedge => Pool::Dynamic,
+            RobotState::EvHedge => Pool::Ev,
+            // 熔断 / 结算态不发新单，给个默认。
+            RobotState::CircuitBreaker | RobotState::SettlementWait => Pool::GridMaker,
         }
     }
 }

@@ -103,35 +103,48 @@ mod tests {
         }
     }
 
-    fn ctx<'a>(
+    use domain::round_state::RoundState;
+
+    struct Ctx {
         market: MarketSnapshot,
         position: PositionSnapshot,
-        active: &'a [ActiveOrder],
-    ) -> DecisionContext<'a> {
-        DecisionContext {
-            total_capital: dec!(1000),
-            trigger: Trigger::BookUpdate,
-            now: 0,
-            time_to_expiry: 600_000,
-            state: RobotState::Building,
-            main_field: None,
-            main_field_frozen: false,
-            position,
-            market,
-            pools: PoolBudgets {
-                grid_maker_total: dec!(150),
-                grid_maker_remaining: dec!(150),
-                dynamic_remaining: dec!(225),
-                ev_remaining: dec!(375),
-                max_exposure: dec!(112.5),
-            },
-            active_orders: active,
-            last_hedge_at: None,
-            funds_exhausted: false,
-            double_negative_count: 0,
-            was_double_negative: false,
-            calm_since: None,
-            constraints: OrderConstraints::default(),
+        active: Vec<ActiveOrder>,
+        round: RoundState,
+    }
+
+    impl Ctx {
+        fn new(
+            market: MarketSnapshot,
+            position: PositionSnapshot,
+            active: Vec<ActiveOrder>,
+        ) -> Self {
+            Self {
+                market,
+                position,
+                active,
+                round: RoundState::new(),
+            }
+        }
+
+        fn build(&self) -> DecisionContext<'_> {
+            DecisionContext {
+                total_capital: dec!(1000),
+                trigger: Trigger::BookUpdate,
+                now: 0,
+                time_to_expiry: 600_000,
+                position: self.position,
+                market: self.market,
+                pools: PoolBudgets {
+                    grid_maker_total: dec!(150),
+                    grid_maker_remaining: dec!(150),
+                    dynamic_remaining: dec!(225),
+                    ev_remaining: dec!(375),
+                    max_exposure: dec!(112.5),
+                },
+                active_orders: &self.active,
+                constraints: OrderConstraints::default(),
+                round: &self.round,
+            }
         }
     }
 
@@ -184,7 +197,8 @@ mod tests {
             up: book(Some(dec!(0.39)), Some(dec!(0.40))),
             down: book(Some(dec!(0.59)), Some(dec!(0.60))),
         };
-        let d = strat().decide(&ctx(market, empty_pos(), &[]));
+        let c = Ctx::new(market, empty_pos(), vec![]);
+        let d = strat().decide(&c.build());
         // 三档都满足最小量 → 三条 Submit。
         assert_eq!(d.commands.len(), 3);
         // 价格依次为 0.39/0.38/0.37（ask 0.40 减 0.01/0.02/0.03）。
@@ -212,7 +226,8 @@ mod tests {
             up_cost: dec!(4),
             down_cost: dec!(0),
         };
-        let d = strat().decide(&ctx(market, pos, &[]));
+        let c = Ctx::new(market, pos, vec![]);
+        let d = strat().decide(&c.build());
         assert_eq!(d.transition, Some(RobotState::Pairing));
     }
 
@@ -230,7 +245,8 @@ mod tests {
             qty: dec!(10),
             role: OrderRole::Maker,
         }];
-        let d = strat().decide(&ctx(market, empty_pos(), &active));
+        let c = Ctx::new(market, empty_pos(), active.to_vec());
+        let d = strat().decide(&c.build());
         assert!(d.is_skip());
     }
 
@@ -240,7 +256,8 @@ mod tests {
             up: book(Some(dec!(0.55)), Some(dec!(0.56))),
             down: book(Some(dec!(0.55)), Some(dec!(0.56))),
         };
-        let d = strat().decide(&ctx(market, empty_pos(), &[]));
+        let c = Ctx::new(market, empty_pos(), vec![]);
+        let d = strat().decide(&c.build());
         assert!(d.is_skip());
     }
 }

@@ -1,10 +1,10 @@
 //! 决策：组装只读上下文，过全局路由，派发给对应阶段小策略。纯查询，不改状态。
 
 use crate::config::Pool;
-use crate::Engine;
-use strategy::context::{Decision, DecisionContext, PoolBudgets, Trigger};
-use strategy::router::{Phase, Route};
+use crate::core::Engine;
 use strategy::PhaseStrategy;
+use strategy::context::{ActiveOrder, Decision, DecisionContext, PoolBudgets, Trigger};
+use strategy::router::{Phase, Route};
 
 impl Engine {
     /// 组装上下文 → 全局路由 → 小策略决策。
@@ -15,9 +15,6 @@ impl Engine {
             trigger,
             now: self.now,
             time_to_expiry: self.time_to_expiry,
-            state: self.machine.state(),
-            main_field: self.main_field,
-            main_field_frozen: self.main_field_frozen,
             position: self.ledger.snapshot(),
             market: self.market,
             pools: PoolBudgets {
@@ -28,9 +25,8 @@ impl Engine {
                 max_exposure: self.cfg.pools.max_exposure(),
             },
             active_orders: &active,
-            last_hedge_at: self.last_hedge_at,
-            calm_since: self.calm_since,
             constraints: self.cfg.constraints,
+            round: &self.round,
         };
 
         match strategy::route(&ctx, &self.cfg.strategy) {
@@ -44,9 +40,24 @@ impl Engine {
         match phase {
             Phase::Building => self.building.decide(ctx),
             Phase::Pairing => self.pairing.decide(ctx),
-            Phase::DynamicHedge | Phase::Observing => self.dynamic.decide(ctx),
+            Phase::DynamicHedge => self.dynamic.decide(ctx),
             Phase::EvHedge => self.ev.decide(ctx),
             Phase::CircuitBreaker => self.circuit.decide(ctx),
         }
+    }
+
+    /// 当前活跃挂单的只读视图（喂给小策略）。
+    pub(crate) fn active_orders(&self) -> Vec<ActiveOrder> {
+        self.book
+            .iter()
+            .map(|o| ActiveOrder {
+                order_id: o.order_id,
+                side: o.side,
+                direction: o.direction,
+                price: o.price,
+                qty: o.qty,
+                role: o.role,
+            })
+            .collect()
     }
 }

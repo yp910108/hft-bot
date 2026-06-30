@@ -8,5 +8,6 @@ pub mod fee;
 pub mod market;
 pub mod order;
 pub mod pnl;
+pub mod round_state;
 pub mod state;
 pub mod types;

@@ -39,8 +39,8 @@ impl DynamicHedgeStrategy {
     ///
     /// 从 ctx 全局上下文读 count/was，算出本 tick 最新值。
     fn edge_triggered_count(&self, ctx: &DecisionContext) -> (u8, bool) {
-        let base = ctx.double_negative_count;
-        let was = ctx.was_double_negative;
+        let base = ctx.round.double_negative_count;
+        let was = ctx.round.was_double_negative;
         let current = ctx.position.both_sides_settle_negative();
         let count = if current && !was { base + 1 } else { base };
         (count, current)
@@ -119,7 +119,9 @@ impl DynamicHedgeStrategy {
             let rung_budget = step_budget * rung.step_fraction;
             let qty = ctx.constraints.quantize_qty(rung_budget / price);
             if ctx.constraints.is_satisfied(qty, price) {
-                cmds.push(CommandIntent::Submit(OrderIntent::maker_buy(side, price, qty)));
+                cmds.push(CommandIntent::Submit(OrderIntent::maker_buy(
+                    side, price, qty,
+                )));
             }
         }
         cmds
@@ -170,7 +172,7 @@ impl PhaseStrategy for DynamicHedgeStrategy {
         }
 
         // 2. 资金耗尽黏住。
-        if ctx.funds_exhausted {
+        if ctx.round.funds_exhausted {
             return Decision::skip();
         }
 
@@ -197,7 +199,9 @@ impl PhaseStrategy for DynamicHedgeStrategy {
 
         // 6. 织网。
         let Some(target) = Self::target_side(ctx) else {
-            return self.settle_or_idle(ctx).with_dn_update(next_count, current_is_dn);
+            return self
+                .settle_or_idle(ctx)
+                .with_dn_update(next_count, current_is_dn);
         };
 
         let gap = ctx
@@ -214,16 +218,20 @@ impl PhaseStrategy for DynamicHedgeStrategy {
             || first_price <= Price::ZERO
             || !ctx.constraints.is_satisfied(gap, first_price)
         {
-            return self.settle_or_idle(ctx).with_dn_update(next_count, current_is_dn);
+            return self
+                .settle_or_idle(ctx)
+                .with_dn_update(next_count, current_is_dn);
         }
 
         // 资金耗尽。
         let step_budget = ctx.pools.dynamic_remaining * self.cfg.dynamic_step_fraction;
         let budget_qty = ctx.constraints.quantize_qty(step_budget / first_price);
         if !ctx.constraints.is_satisfied(budget_qty, first_price) {
-            return Decision::skip()
+            let mut d = Decision::skip()
                 .with(CommandIntent::CancelAll)
                 .with_dn_update(next_count, current_is_dn);
+            d.mark_funds_exhausted = true;
+            return d;
         }
 
         // 正常织网。
@@ -260,6 +268,8 @@ mod tests {
     use domain::market::{BookTop, MarketSnapshot};
     use domain::order::{OrderConstraints, OrderDirection, OrderId};
     use domain::pnl::PositionSnapshot;
+    use domain::round_state::RoundState;
+    use domain::state::RobotState;
     use domain::types::OrderRole;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
@@ -278,15 +288,15 @@ mod tests {
         active: Vec<ActiveOrder>,
         now: u64,
         tte: u64,
-        last_hedge_at: Option<u64>,
-        funds_exhausted: bool,
         dynamic_remaining: Decimal,
-        double_negative_count: u8,
-        was_double_negative: bool,
+        round_state: RoundState,
     }
 
     impl Builder {
         fn new() -> Self {
+            let mut round = RoundState::new();
+            round.state = RobotState::DynamicHedge;
+            round.main_field = Some(Side::Up);
             Self {
                 position: PositionSnapshot {
                     up_qty: dec!(100),
@@ -301,11 +311,8 @@ mod tests {
                 active: Vec::new(),
                 now: 10_000,
                 tte: 600_000,
-                last_hedge_at: None,
-                funds_exhausted: false,
                 dynamic_remaining: dec!(225),
-                double_negative_count: 0,
-                was_double_negative: false,
+                round_state: round,
             }
         }
 
@@ -315,9 +322,6 @@ mod tests {
                 trigger: Trigger::Fill { side: Side::Up },
                 now: self.now,
                 time_to_expiry: self.tte,
-                state: RobotState::DynamicHedge,
-                main_field: Some(Side::Up),
-                main_field_frozen: false,
                 position: self.position,
                 market: self.market,
                 pools: PoolBudgets {
@@ -328,12 +332,8 @@ mod tests {
                     max_exposure: dec!(112.5),
                 },
                 active_orders: &self.active,
-                last_hedge_at: self.last_hedge_at,
-                funds_exhausted: self.funds_exhausted,
-                double_negative_count: self.double_negative_count,
-                was_double_negative: self.was_double_negative,
-                calm_since: None,
                 constraints: OrderConstraints::default(),
+                round: &self.round_state,
             }
         }
     }
@@ -380,7 +380,7 @@ mod tests {
     #[test]
     fn funds_exhausted_sticks_skip() {
         let mut b = Builder::new();
-        b.funds_exhausted = true;
+        b.round_state.funds_exhausted = true;
         let d = strat().decide(&b.build());
         assert!(d.is_skip());
     }
@@ -388,8 +388,8 @@ mod tests {
     #[test]
     fn double_negative_twice_upgrades_ev_when_tte_small() {
         let mut b = Builder::new();
-        b.double_negative_count = 1;
-        b.was_double_negative = false;
+        b.round_state.double_negative_count = 1;
+        b.round_state.was_double_negative = false;
         b.position = PositionSnapshot {
             up_qty: dec!(40),
             down_qty: dec!(50),
@@ -405,8 +405,8 @@ mod tests {
     #[test]
     fn double_negative_twice_no_ev_when_tte_large() {
         let mut b = Builder::new();
-        b.double_negative_count = 1;
-        b.was_double_negative = false;
+        b.round_state.double_negative_count = 1;
+        b.round_state.was_double_negative = false;
         b.position = PositionSnapshot {
             up_qty: dec!(40),
             down_qty: dec!(50),
@@ -428,16 +428,24 @@ mod tests {
             down_cost: dec!(45),
         };
         let d = strat().decide(&b.build());
-        assert!(!d.commands.iter().any(|c| matches!(c, CommandIntent::Submit(_))));
+        assert!(
+            !d.commands
+                .iter()
+                .any(|c| matches!(c, CommandIntent::Submit(_)))
+        );
     }
 
     #[test]
     fn cooldown_blocks_new_step() {
         let mut b = Builder::new();
-        b.last_hedge_at = Some(9_500);
+        b.round_state.last_hedge_at = Some(9_500);
         b.now = 10_000;
         let d = strat().decide(&b.build());
-        assert!(!d.commands.iter().any(|c| matches!(c, CommandIntent::Submit(_))));
+        assert!(
+            !d.commands
+                .iter()
+                .any(|c| matches!(c, CommandIntent::Submit(_)))
+        );
     }
 
     #[test]
@@ -459,7 +467,11 @@ mod tests {
         }];
         let d = strat().decide(&b.build());
         assert_ne!(d.transition, Some(RobotState::EvHedge));
-        assert!(!d.commands.iter().any(|c| matches!(c, CommandIntent::Submit(_))));
+        assert!(
+            !d.commands
+                .iter()
+                .any(|c| matches!(c, CommandIntent::Submit(_)))
+        );
     }
 
     #[test]
@@ -541,7 +553,9 @@ mod tests {
         };
         let d = strat().decide(&b.build());
         assert!(
-            !d.commands.iter().any(|c| matches!(c, CommandIntent::Submit(_))),
+            !d.commands
+                .iter()
+                .any(|c| matches!(c, CommandIntent::Submit(_))),
             "Target 侧持仓成本已逼近红线，补单应被挡住"
         );
     }
@@ -550,8 +564,8 @@ mod tests {
     fn idle_path_writes_back_edge_state() {
         // 安全区间挂机也要通过 with_dn_update 写回边沿状态。
         let mut b = Builder::new();
-        b.double_negative_count = 0;
-        b.was_double_negative = false;
+        b.round_state.double_negative_count = 0;
+        b.round_state.was_double_negative = false;
         // 两侧都负但 worst 在安全区间：Up 95/Down 96，成本 100 → up −5、down −4，worst=−5 > −20。
         b.position = PositionSnapshot {
             up_qty: dec!(95),

@@ -47,7 +47,7 @@ impl PhaseStrategy for CircuitBreakerStrategy {
         }
 
         // spread 已平静，但要持续稳定 ≥ 5 秒才恢复。
-        match ctx.calm_since {
+        match ctx.round.calm_since {
             Some(since) if ctx.now >= since + self.cfg.circuit_recover_stable => {
                 // 稳定够久 → 恢复，跳回阶段态。
                 Decision::transition(Self::recovery_target(ctx))
@@ -65,6 +65,8 @@ mod tests {
     use domain::market::{BookTop, MarketSnapshot};
     use domain::order::OrderConstraints;
     use domain::pnl::PositionSnapshot;
+    use domain::round_state::RoundState;
+    use domain::state::RobotState;
     use domain::types::{Price, Side};
     use rust_decimal_macros::dec;
 
@@ -79,21 +81,23 @@ mod tests {
     struct Builder {
         market: MarketSnapshot,
         now: u64,
-        calm_since: Option<u64>,
         has_position: bool,
+        round_state: RoundState,
     }
 
     impl Builder {
         fn new() -> Self {
+            let mut round = RoundState::new();
+            round.state = RobotState::CircuitBreaker;
+            round.main_field = Some(Side::Up);
             Self {
-                // 健康窄 spread。
                 market: MarketSnapshot {
                     up: book(dec!(0.40), dec!(0.41)),
                     down: book(dec!(0.58), dec!(0.60)),
                 },
                 now: 10_000,
-                calm_since: None,
                 has_position: true,
+                round_state: round,
             }
         }
 
@@ -119,9 +123,6 @@ mod tests {
                 trigger: Trigger::BookUpdate,
                 now: self.now,
                 time_to_expiry: 600_000,
-                state: RobotState::CircuitBreaker,
-                main_field: Some(Side::Up),
-                main_field_frozen: false,
                 position,
                 market: self.market,
                 pools: PoolBudgets {
@@ -132,12 +133,8 @@ mod tests {
                     max_exposure: dec!(112.5),
                 },
                 active_orders: NO_ORDERS,
-                last_hedge_at: None,
-                funds_exhausted: false,
-                double_negative_count: 0,
-                was_double_negative: false,
-                calm_since: self.calm_since,
                 constraints: OrderConstraints::default(),
+                round: &self.round_state,
             }
         }
     }
@@ -153,7 +150,7 @@ mod tests {
             up: book(dec!(0.40), dec!(0.41)),
             down: book(dec!(0.20), dec!(0.55)), // Down spread 爆宽。
         };
-        b.calm_since = None;
+        b.round_state.calm_since = None;
         assert!(strat().decide(&b.build()).is_skip());
     }
 
@@ -161,7 +158,7 @@ mod tests {
     fn stays_when_calm_not_long_enough() {
         let mut b = Builder::new();
         // 平静起始 8000，现在 10000，只过了 2 秒 < 5 秒。
-        b.calm_since = Some(8_000);
+        b.round_state.calm_since = Some(8_000);
         b.now = 10_000;
         assert!(strat().decide(&b.build()).is_skip());
     }
@@ -170,7 +167,7 @@ mod tests {
     fn recovers_after_five_seconds_calm() {
         let mut b = Builder::new();
         // 平静起始 4000，现在 10000，过了 6 秒 ≥ 5 → 恢复到配对态（有持仓）。
-        b.calm_since = Some(4_000);
+        b.round_state.calm_since = Some(4_000);
         b.now = 10_000;
         b.has_position = true;
         let d = strat().decide(&b.build());
@@ -180,7 +177,7 @@ mod tests {
     #[test]
     fn recovers_to_building_when_no_position() {
         let mut b = Builder::new();
-        b.calm_since = Some(4_000);
+        b.round_state.calm_since = Some(4_000);
         b.now = 10_000;
         b.has_position = false;
         let d = strat().decide(&b.build());

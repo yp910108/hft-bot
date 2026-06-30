@@ -125,7 +125,7 @@ impl PairingStrategy {
 
 impl PhaseStrategy for PairingStrategy {
     fn decide(&self, ctx: &DecisionContext) -> Decision {
-        let main = match ctx.main_field {
+        let main = match ctx.round.main_field {
             Some(s) => s,
             None => return Decision::skip(),
         };
@@ -144,7 +144,7 @@ impl PhaseStrategy for PairingStrategy {
         let mut decision = Decision::skip();
 
         // ① 续挂追低：在主战场当前最深挂单价下方再挂一档（受敞口刹车 + 永久停铺）。
-        if !ctx.main_field_frozen {
+        if !ctx.round.main_field_frozen {
             // 找主战场当前最低活跃挂单价（最深买价）。
             let lowest_active_price = ctx
                 .active_orders
@@ -174,8 +174,8 @@ impl PhaseStrategy for PairingStrategy {
                         if ctx.constraints.is_satisfied(qty, follow_price) {
                             if self.exposure_would_exceed(ctx, main, notional) {
                                 // 撞敞口红线：撤主战场全部挂单，做市阶段永久停铺。
-                                // engine 据 CancelSide(main) 在配对态下的语义置 frozen。
                                 decision = decision.with(CommandIntent::CancelSide(main));
+                                decision.freeze_main_field = true;
                             } else {
                                 decision = decision.with(CommandIntent::Submit(
                                     OrderIntent::maker_buy(main, follow_price, qty),
@@ -237,6 +237,8 @@ mod tests {
     use domain::market::{BookTop, MarketSnapshot};
     use domain::order::{OrderConstraints, OrderDirection, OrderId};
     use domain::pnl::PositionSnapshot;
+    use domain::round_state::RoundState;
+    use domain::state::RobotState;
     use domain::types::OrderRole;
     use rust_decimal_macros::dec;
 
@@ -254,11 +256,14 @@ mod tests {
         market: MarketSnapshot,
         active: Vec<ActiveOrder>,
         tte: u64,
-        frozen: bool,
+        round_state: RoundState,
     }
 
     impl Builder {
         fn new() -> Self {
+            let mut round = RoundState::new();
+            round.state = RobotState::Pairing;
+            round.main_field = Some(Side::Up);
             Self {
                 trigger: Trigger::Fill { side: Side::Up },
                 // 双边已建仓、未穿任何线的正常配对基线：
@@ -276,7 +281,7 @@ mod tests {
                 },
                 active: Vec::new(),
                 tte: 600_000,
-                frozen: false,
+                round_state: round,
             }
         }
 
@@ -286,9 +291,6 @@ mod tests {
                 trigger: self.trigger,
                 now: 0,
                 time_to_expiry: self.tte,
-                state: RobotState::Pairing,
-                main_field: Some(Side::Up),
-                main_field_frozen: self.frozen,
                 position: self.position,
                 market: self.market,
                 pools: PoolBudgets {
@@ -299,12 +301,8 @@ mod tests {
                     max_exposure: dec!(112.5),
                 },
                 active_orders: &self.active,
-                last_hedge_at: None,
-                funds_exhausted: false,
-                double_negative_count: 0,
-                was_double_negative: false,
-                calm_since: None,
                 constraints: OrderConstraints::default(),
+                round: &self.round_state,
             }
         }
     }
@@ -389,10 +387,7 @@ mod tests {
         };
         b.trigger = Trigger::BookUpdate; // 退出检查与触发无关。
         let d = strat().decide(&b.build());
-        assert_eq!(
-            d.transition,
-            Some(RobotState::DynamicHedge)
-        );
+        assert_eq!(d.transition, Some(RobotState::DynamicHedge));
     }
 
     #[test]
@@ -410,10 +405,7 @@ mod tests {
             down: book(Some(dec!(0.71)), Some(dec!(0.73))),
         };
         let d = strat().decide(&b.build());
-        assert_eq!(
-            d.transition,
-            Some(RobotState::DynamicHedge)
-        );
+        assert_eq!(d.transition, Some(RobotState::DynamicHedge));
     }
 
     #[test]
@@ -518,7 +510,7 @@ mod tests {
     #[test]
     fn frozen_main_field_skips_follow() {
         let mut b = Builder::new();
-        b.frozen = true;
+        b.round_state.main_field_frozen = true;
         let d = strat().decide(&b.build());
         // 永久停铺 → 无 Up 续挂单（但仍有 Down 配对）。
         assert!(
