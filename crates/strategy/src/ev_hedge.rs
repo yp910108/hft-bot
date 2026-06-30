@@ -80,8 +80,12 @@ impl PhaseStrategy for EvHedgeStrategy {
             return Decision::skip();
         }
 
-        // 5. 出手甜区判定：概率 ∈ [0.75, 0.85] → 开火（需盘口有合适的货）。
-        let (low, high) = self.cfg.ev_sweet;
+        // 5. 出手甜区判定（分时段）：TTE>5min [0.60,0.75] / 5~1min [0.75,0.85]。
+        let (low, high) = if ctx.time_to_expiry > self.cfg.ev_entry_window {
+            self.cfg.ev_sweet_far
+        } else {
+            self.cfg.ev_sweet_near
+        };
         if prob >= low && prob <= high {
             // 盘口检查：best_ask 存在且 ≤ 保护价才开火，否则装死等盘口回来（不触发冷却）。
             let can_fire = ctx

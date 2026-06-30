@@ -6,8 +6,8 @@
 //! 决策顺序（每 tick）：
 //! 1. 微利逃生：两侧结算 pnl 都 ≥ +0.25%V → 撤单扛结算。
 //! 2. 资金耗尽黏住：funds_exhausted 已置 → Skip（不再对冲）。
-//! 3. 双边负 2 次 且 TTE<5min → 升级 EV（动态对冲专属失效信号）。
-//! 4. pnl 在安全区间 (−2%V, +0.25%V) → Skip 静默等行情。
+//! 3. 双边负 2 次 → 升级 EV（不限 TTE，立即进 EV）。
+//! 4. pnl ≥ −1%V 且缺口平齐 → 静默挂机。
 //! 5. 冷却中 → Skip。
 //! 6. 织网（带摽齐 Cap）：
 //!    a. 缺口 ≤ 0 或粉尘缺口 → 视同平齐：查利润达标则撤单扛结算，否则 Skip。
@@ -75,12 +75,30 @@ impl DynamicHedgeStrategy {
             .map(|o| o.order_id)
     }
 
-    /// 单步织网（带摽齐 Cap + 价位防重）。
+    /// 单步织网（带摽齐 Cap + 宏观总量封顶 + 差额追加）。
+    ///
+    /// 宏观封顶：先算 Target 侧**所有**活跃挂单总量，`可用增量 = gap − 总活跃`。
+    /// 可用增量 ≤ 0 说明已挂的单已经覆盖了整个缺口（哪怕散在不同价位），不再发新单。
+    /// 可用增量 > 0 才在各档分配、差额追加。避免行情移动时旧单在别的价位占坑导致过度对冲。
     fn weave(&self, ctx: &DecisionContext, side: Side, gap: Qty) -> Vec<CommandIntent> {
         let best_ask = match ctx.market.book(side).best_ask {
             Some(a) => a,
             None => return Vec::new(),
         };
+
+        // 宏观封顶：Target 侧所有活跃挂单总量（不区分价位）。
+        let total_active: Qty = ctx
+            .active_orders
+            .iter()
+            .filter(|o| o.side == side)
+            .map(|o| o.qty)
+            .sum();
+        let macro_available = if gap > total_active {
+            gap - total_active
+        } else {
+            return Vec::new(); // 已挂的单已覆盖缺口，不发新单。
+        };
+
         let step_budget = ctx.pools.dynamic_remaining * self.cfg.dynamic_step_fraction;
         let first_price = ctx
             .constraints
@@ -90,41 +108,80 @@ impl DynamicHedgeStrategy {
         }
         let budget_qty = step_budget / first_price;
 
+        // 本步实际可发总量 = min(预算可买, 宏观可用增量)。
+        let step_cap = if macro_available < budget_qty {
+            macro_available
+        } else {
+            budget_qty
+        };
+
         if gap <= budget_qty {
             // 摽齐 Cap：全挂第一档。
-            if ctx.has_active_order_at(side, first_price) {
-                return Vec::new();
-            }
-            let qty = ctx.constraints.quantize_qty(gap);
-            if ctx.constraints.is_satisfied(qty, first_price) {
+            // 先算绝对缺口（gap − 该价位活跃），再用 step_cap 截断。避免双重扣减。
+            let active_at_price = self.active_qty_at(ctx, side, first_price);
+            let price_gap = if gap > active_at_price {
+                ctx.constraints.quantize_qty(gap - active_at_price)
+            } else {
+                Qty::ZERO
+            };
+            // 用宏观 step_cap 截断，防过度对冲。
+            let increment = if price_gap < step_cap {
+                price_gap
+            } else {
+                ctx.constraints.quantize_qty(step_cap)
+            };
+            if increment > Qty::ZERO && ctx.constraints.is_satisfied(increment, first_price) {
                 return vec![CommandIntent::Submit(OrderIntent::maker_buy(
                     side,
                     first_price,
-                    qty,
+                    increment,
                 ))];
             }
             return Vec::new();
         }
 
-        // 三档蚕食。
+        // 三档蚕食。每档差额追加，但总量不超 step_cap。
         let mut cmds = Vec::new();
+        let mut remaining_cap = step_cap;
         for rung in &self.cfg.dynamic_rungs {
+            if remaining_cap <= Qty::ZERO {
+                break;
+            }
             let price = ctx.constraints.quantize_price(best_ask - rung.price_offset);
             if price <= Price::ZERO {
                 continue;
             }
-            if ctx.has_active_order_at(side, price) {
-                continue;
-            }
             let rung_budget = step_budget * rung.step_fraction;
-            let qty = ctx.constraints.quantize_qty(rung_budget / price);
-            if ctx.constraints.is_satisfied(qty, price) {
+            let rung_target = ctx.constraints.quantize_qty(rung_budget / price);
+            let active_at_price = self.active_qty_at(ctx, side, price);
+            let rung_increment = if rung_target > active_at_price {
+                ctx.constraints.quantize_qty(rung_target - active_at_price)
+            } else {
+                Qty::ZERO
+            };
+            // 不超过剩余 cap。
+            let actual = if rung_increment < remaining_cap {
+                rung_increment
+            } else {
+                ctx.constraints.quantize_qty(remaining_cap)
+            };
+            if actual > Qty::ZERO && ctx.constraints.is_satisfied(actual, price) {
                 cmds.push(CommandIntent::Submit(OrderIntent::maker_buy(
-                    side, price, qty,
+                    side, price, actual,
                 )));
+                remaining_cap -= actual;
             }
         }
         cmds
+    }
+
+    /// 某侧某价位的活跃挂单总量。
+    fn active_qty_at(&self, ctx: &DecisionContext, side: Side, price: Price) -> Qty {
+        ctx.active_orders
+            .iter()
+            .filter(|o| o.side == side && o.price == price)
+            .map(|o| o.qty)
+            .sum()
     }
 
     /// Target Side 自身总敞口是否超红线。
@@ -158,7 +215,6 @@ impl PhaseStrategy for DynamicHedgeStrategy {
     fn decide(&self, ctx: &DecisionContext) -> Decision {
         let v = ctx.total_capital;
         let escape = self.cfg.dynamic_escape * v;
-        let loss = self.cfg.loss_trigger * v;
 
         let up_settle = ctx.position.settle_pnl(Side::Up);
         let down_settle = ctx.position.settle_pnl(Side::Down);
@@ -179,17 +235,23 @@ impl PhaseStrategy for DynamicHedgeStrategy {
         // 边沿计数（从 ctx 全局量读）。
         let (next_count, current_is_dn) = self.edge_triggered_count(ctx);
 
-        // 3. 双边负 2 次 且 TTE<5min → 升级 EV。
-        if next_count >= 2 && ctx.time_to_expiry < self.cfg.ev_entry_window {
+        // 3. 双边负 2 次 → 升级 EV（不限 TTE，立即进 EV）。
+        if next_count >= 2 {
             return Decision::skip()
                 .with(CommandIntent::CancelAll)
                 .moving_to(RobotState::EvHedge)
                 .with_dn_update(next_count, current_is_dn);
         }
 
-        // 4. 安全区间 → Skip。
-        if worst > loss {
-            return Decision::skip().with_dn_update(next_count, current_is_dn);
+        // 4. 修复完成判定：pnl ≥ 修复线(−1%V) 且 缺口已平齐 → 停止织网静默。
+        //    两条 AND 都满足才停手，避免"刚脱线就停、带着敞口扛结算"。
+        let repair = self.cfg.repair_target * v;
+        let gap_qty = (ctx.position.up_qty - ctx.position.down_qty).abs();
+        let gap_is_flat = !ctx.constraints.is_satisfied(gap_qty, Price::ONE); // 缺口够不到最小单 = 平齐
+        if worst >= repair && gap_is_flat {
+            return self
+                .settle_or_idle(ctx)
+                .with_dn_update(next_count, current_is_dn);
         }
 
         // 5. 冷却中。
@@ -403,7 +465,8 @@ mod tests {
     }
 
     #[test]
-    fn double_negative_twice_no_ev_when_tte_large() {
+    fn double_negative_twice_upgrades_ev_regardless_of_tte() {
+        // 新逻辑：双边负 2 次不限 TTE，即使 TTE > 5min 也立即进 EV。
         let mut b = Builder::new();
         b.round_state.double_negative_count = 1;
         b.round_state.was_double_negative = false;
@@ -413,13 +476,15 @@ mod tests {
             up_cost: dec!(50),
             down_cost: dec!(50),
         };
-        b.tte = 600_000;
+        b.tte = 600_000; // > 5min，旧逻辑不进 EV，新逻辑照进。
         let d = strat().decide(&b.build());
-        assert_ne!(d.transition, Some(RobotState::EvHedge));
+        assert!(d.commands.contains(&CommandIntent::CancelAll));
+        assert_eq!(d.transition, Some(RobotState::EvHedge));
     }
 
     #[test]
-    fn observe_band_skips() {
+    fn continues_weaving_when_pnl_ok_but_gap_large() {
+        // 新逻辑：pnl 已修复（> −1%V）但缺口仍大（12 > 最小量 5）→ 不停手，继续织网。
         let mut b = Builder::new();
         b.position = PositionSnapshot {
             up_qty: dec!(88),
@@ -428,10 +493,33 @@ mod tests {
             down_cost: dec!(45),
         };
         let d = strat().decide(&b.build());
+        // worst = 88−90 = −2 > −10 (repair)，但缺口 12 > 5 → 继续织网。
+        assert!(
+            d.commands
+                .iter()
+                .any(|c| matches!(c, CommandIntent::Submit(_))),
+            "pnl 已修复但缺口大，应继续织网"
+        );
+    }
+
+    #[test]
+    fn stops_when_pnl_repaired_and_gap_flat() {
+        // 新逻辑：pnl ≥ −1%V 且 缺口 ≤ 最小量 → 修复完成，停手静默。
+        let mut b = Builder::new();
+        // Up 98 / Down 100，缺口 2 < 最小量 5。总成本 90 → worst = 98−90 = 8 > −10 ✓。
+        b.position = PositionSnapshot {
+            up_qty: dec!(98),
+            down_qty: dec!(100),
+            up_cost: dec!(45),
+            down_cost: dec!(45),
+        };
+        let d = strat().decide(&b.build());
+        // 两条 AND 都满足 → 停手（无 Submit）。
         assert!(
             !d.commands
                 .iter()
-                .any(|c| matches!(c, CommandIntent::Submit(_)))
+                .any(|c| matches!(c, CommandIntent::Submit(_))),
+            "pnl 修复 + 缺口平齐，应停手静默"
         );
     }
 
@@ -512,7 +600,8 @@ mod tests {
     }
 
     #[test]
-    fn weave_skips_occupied_price_levels() {
+    fn weave_appends_increment_at_occupied_price() {
+        // 差额追加：0.69/0.68 各有旧单 10 股，本档应挂更多 → 追加差额而非跳过。
         let mut b = Builder::new();
         b.active = vec![
             ActiveOrder {
@@ -534,11 +623,37 @@ mod tests {
         ];
         let ctx = b.build();
         let cmds = strat().weave(&ctx, Side::Down, dec!(10000));
+        // 前两档旧单已超本档应挂 → 只有第三档 0.67 发增量。
         assert_eq!(cmds.len(), 1);
         if let CommandIntent::Submit(o) = &cmds[0] {
             assert_eq!(o.price, dec!(0.67));
         } else {
-            panic!("应只在未占用的 0.67 档发单");
+            panic!("应在 0.67 发增量单");
+        }
+    }
+
+    #[test]
+    fn weave_appends_partial_increment() {
+        // 差额追加：旧单 3 股，本档应挂 ≈9.78 股 → 追加 ≈6.78 股（≥最小量 5）。
+        let mut b = Builder::new();
+        b.active = vec![ActiveOrder {
+            order_id: OrderId(1),
+            side: Side::Down,
+            direction: OrderDirection::Buy,
+            price: dec!(0.69),
+            qty: dec!(3),
+            role: OrderRole::Maker,
+        }];
+        let ctx = b.build();
+        let cmds = strat().weave(&ctx, Side::Down, dec!(10000));
+        // 第 1 档 0.69：应挂 ≈9.78，旧 3，增量 ≈6.78 ≥ 5 → 发。
+        // 第 2/3 档无旧单 → 正常发。共 3 笔。
+        assert_eq!(cmds.len(), 3);
+        if let CommandIntent::Submit(o) = &cmds[0] {
+            assert_eq!(o.price, dec!(0.69));
+            assert!(o.qty > dec!(0) && o.qty < dec!(10), "应为差额而非全量");
+        } else {
+            panic!("第一档应有增量单");
         }
     }
 

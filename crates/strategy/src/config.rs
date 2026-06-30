@@ -43,8 +43,8 @@ pub struct StrategyConfig {
     pub making_profit_lock: Decimal,
     /// 动态对冲微利逃生线 +0.25%V。
     pub dynamic_escape: Decimal,
-    /// 观察线 −0.5%V（pnl 在此以上进观察/静默）。
-    pub observe_line: Decimal,
+    /// 动态对冲修复线 −1%V：pnl 修复到此线以上 + 缺口平齐才允许静默。
+    pub repair_target: Decimal,
     /// 亏损触发线 −2%V（全局共用）。
     pub loss_trigger: Decimal,
     /// 单边持仓门槛 3%V（结算 pnl 触发的对侧成本门槛）。
@@ -63,7 +63,7 @@ pub struct StrategyConfig {
     pub deep_sea_deviation: Decimal,
 
     // ---- EV 对冲 ----
-    /// EV 进入大门：TTE < 此值才允许进入 EV 态（5 分钟）。
+    /// 尾盘阈值：TTE < 此值时触发全局尾盘规则（5min）。双边负 2 次不受此限。
     pub ev_entry_window: Millis,
     /// 单步资金占 EV 池剩余的比例 25%。
     pub ev_step_fraction: Decimal,
@@ -71,8 +71,10 @@ pub struct StrategyConfig {
     pub ev_price_cap: Decimal,
     /// 两步之间冷却（毫秒）。
     pub ev_cooldown: Millis,
-    /// 出手甜区（统一，TTE 5min~1min 时使用）。
-    pub ev_sweet: (Decimal, Decimal),
+    /// 出手甜区（TTE > 5min）：优势方概率区间。
+    pub ev_sweet_far: (Decimal, Decimal),
+    /// 出手甜区（TTE 5min ~ 1min）：优势方概率区间。
+    pub ev_sweet_near: (Decimal, Decimal),
     /// 反转退出线：优势方概率跌破此值立即收手。
     pub ev_reversal: Decimal,
 
@@ -116,7 +118,7 @@ impl Default for StrategyConfig {
 
             making_profit_lock: dec!(0.005),
             dynamic_escape: dec!(0.0025),
-            observe_line: dec!(-0.005),
+            repair_target: dec!(-0.01),
             loss_trigger: dec!(-0.02),
             single_side_threshold: dec!(0.03),
 
@@ -143,7 +145,8 @@ impl Default for StrategyConfig {
             ev_step_fraction: dec!(0.25),
             ev_price_cap: dec!(0.85),
             ev_cooldown: 2_000,
-            ev_sweet: (dec!(0.75), dec!(0.85)),
+            ev_sweet_far: (dec!(0.60), dec!(0.75)),
+            ev_sweet_near: (dec!(0.75), dec!(0.85)),
             ev_reversal: dec!(0.55),
 
             circuit_trigger_ratio: dec!(0.30),
@@ -180,8 +183,9 @@ mod tests {
     fn profit_lines_ordered() {
         let cfg = StrategyConfig::default();
         // 亏损线 < 观察线 < 0 < 微利逃生 < 做市锁定。
-        assert!(cfg.loss_trigger < cfg.observe_line);
-        assert!(cfg.observe_line < Decimal::ZERO);
+        // 亏损线 < 修复线 < 0 < 微利逃生 < 做市锁定。
+        assert!(cfg.loss_trigger < cfg.repair_target);
+        assert!(cfg.repair_target < Decimal::ZERO);
         assert!(Decimal::ZERO < cfg.dynamic_escape);
         assert!(cfg.dynamic_escape < cfg.making_profit_lock);
     }
@@ -201,12 +205,18 @@ mod tests {
     }
 
     #[test]
-    fn ev_sweet_band_is_valid() {
+    fn ev_sweet_bands_are_valid() {
         let cfg = StrategyConfig::default();
-        let (low, high) = cfg.ev_sweet;
-        // 甜区下界 > 反转线，上界 < 1。
-        assert!(low > cfg.ev_reversal);
-        assert!(high < Decimal::ONE);
-        assert!(low < high);
+        let (far_low, far_high) = cfg.ev_sweet_far;
+        let (near_low, near_high) = cfg.ev_sweet_near;
+        // 两档甜区下界 > 反转线，上界 < 1。
+        assert!(far_low > cfg.ev_reversal);
+        assert!(far_high < Decimal::ONE);
+        assert!(far_low < far_high);
+        assert!(near_low > cfg.ev_reversal);
+        assert!(near_high < Decimal::ONE);
+        assert!(near_low < near_high);
+        // 近档甜区比远档更高（越临近交割确定性要求越高）。
+        assert!(near_low >= far_high);
     }
 }

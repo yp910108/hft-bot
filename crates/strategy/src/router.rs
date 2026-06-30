@@ -15,7 +15,6 @@ use crate::context::{CommandIntent, Decision, DecisionContext};
 use domain::market::MarketSnapshot;
 use domain::state::RobotState;
 use domain::types::{Price, Side};
-use rust_decimal::Decimal;
 
 /// 路由裁决：要么是某个全局态的直接决策，要么指派给某个阶段小策略。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,16 +51,14 @@ pub fn circuit_should_trip(market: &MarketSnapshot, cfg: &StrategyConfig) -> boo
     })
 }
 
-/// 尾盘规则判定：亏损大侧「结算 pnl × 该侧概率」是否 ≤ 亏损触发线。
+/// 尾盘规则判定：亏损大侧的结算 pnl 是否 ≤ 亏损触发线。
 ///
+/// 不使用概率加权——痛就是痛，只要最坏情况亏损超线就触发，和做市阶段进动态对冲的触发口径一致。
 /// 满足时应进 EV（由 router 直接产出 Decision），不满足则收手扛结算。
 fn tail_end_breach(ctx: &DecisionContext, cfg: &StrategyConfig) -> bool {
     let loss = cfg.loss_trigger * ctx.total_capital;
-    // 找亏损大侧（结算 pnl 更小的那侧）。
     let weaker = ctx.position.weaker_side().unwrap_or(Side::Up);
-    let prob = ctx.market.mark_price(weaker).unwrap_or(Decimal::ONE);
-    let weighted = ctx.position.settle_pnl(weaker) * prob;
-    weighted <= loss
+    ctx.position.settle_pnl(weaker) <= loss
 }
 
 /// 优先级链路由。返回当前 tick 的裁决。
