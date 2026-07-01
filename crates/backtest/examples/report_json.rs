@@ -87,6 +87,7 @@ fn main() {
         report.push(json!({
             "condition_id": market.title,
             "title": market.title,
+            "source_file": market.source_file,
             "cycle_type": "15m",
             "winner": side_label(result.winner),
             "winner_idx": match result.winner { Side::Up => 0, Side::Down => 1 },

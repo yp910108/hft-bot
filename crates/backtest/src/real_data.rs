@@ -125,6 +125,7 @@ pub fn load_market<P: AsRef<Path>>(path: P) -> Result<Market, LoadError> {
         snapshots,
         winner,
         title: market_title(path),
+        source_file: path.to_string_lossy().into_owned(),
     })
 }
 

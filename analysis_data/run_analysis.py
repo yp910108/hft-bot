@@ -194,6 +194,7 @@ def render_market(m, idx, total):
     cycle = m["cycle_type"]
     short = m["title"].replace("Bitcoin Up or Down - ", "")
     result = "WIN" if pnl > 0 else "LOSS"
+    source_file = m.get("source_file", "")
 
     prev_file = f"m{idx-1:03d}.html" if idx > 0 else "index.html"
     next_file = f"m{idx+1:03d}.html" if idx < total - 1 else "index.html"
@@ -208,6 +209,7 @@ def render_market(m, idx, total):
 <h1>#{idx+1}/{total} {short}
 <span style="font-size:13px;padding:2px 8px;border-radius:3px;background:{'#1565C0' if cycle=='5m' else '#6A1B9A'};color:#fff">{cycle}</span>
 </h1>
+{f'<div style="margin:0 20px 8px;font-size:12px;color:#888">源文件: <code style="color:#4FC3F7">{source_file}</code></div>' if source_file else ''}
 <div class="result-box {"win" if pnl>0 else "loss"}">
 <div class="big">{winner}赢 → PnL {pnl:+.2f}</div>
 <div class="sub">总成本 ${total_cost:.2f} | UP赢 {f["pnl_if_up"]:+.2f} | DN赢 {f["pnl_if_dn"]:+.2f} | sum_avg {sum_avg:.4f}</div>

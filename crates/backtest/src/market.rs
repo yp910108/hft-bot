@@ -14,4 +14,6 @@ pub struct Market {
     pub winner: Side,
     /// 场标题（报告展示用），如 "BTC 15m - 2026-05-22 07:30"。
     pub title: String,
+    /// 源 CSV 文件路径（报告溯源用），如 "logs/2026-05-22/07_30_508877.csv"。
+    pub source_file: String,
 }

@@ -227,6 +227,7 @@ mod tests {
             snapshots,
             winner: Side::Up,
             title: "test".to_string(),
+            source_file: "test.csv".to_string(),
         };
         let result = run_match(&market, dec!(1000), FeeModel::default());
         // 跑完不 panic，终态合法，有成交。
