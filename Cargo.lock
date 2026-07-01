@@ -189,6 +189,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "inventory"
+version = "0.1.0"
+dependencies = [
+ "domain",
+ "rust_decimal",
+ "rust_decimal_macros",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
