@@ -1,263 +1,222 @@
-//! 建仓态：开局在主战场侧铺三档梯度 Maker 买单，等首笔成交跳配对。
+//! 阶段 1：开场建仓。双边铺 Maker 买单建底仓。
 //!
-//! 纯函数：没有「我铺过没」的记忆，靠读 ctx 推断——
-//! 主战场无活跃挂单且无持仓 → 铺三档；一旦有持仓（首笔成交）→ 跳配对态。
+//! 逻辑：
+//! - 在 UP 和 DN 两侧各挂 Maker 买单（bid 价排队）。
+//! - 优先便宜侧（price 更低的先挂）。
+//! - 每侧同时只保留一个活跃买单（成交后再挂下一笔）。
+//! - 超过 building_end 时触发阶段跳转到 Cycling。
 
-use crate::PhaseStrategy;
-use crate::config::StrategyConfig;
-use crate::context::{CommandIntent, Decision, DecisionContext, OrderIntent};
-use domain::market::MarketSnapshot;
-use domain::state::RobotState;
-use domain::types::{Money, Price, Qty, Side};
-use rust_decimal::Decimal;
+use crate::context::{ActiveOrder, CommandIntent, Decision, DecisionContext};
+use domain::order::{OrderDirection, TimeInForce};
+use domain::phase::Phase;
+use domain::types::{OrderRole, Side};
 
-/// 建仓态小策略。
-#[derive(Debug, Clone)]
-pub struct BuildingStrategy {
-    cfg: StrategyConfig,
-}
+/// 开场建仓策略。
+pub struct BuildingStrategy;
 
 impl BuildingStrategy {
-    pub fn new(cfg: StrategyConfig) -> Self {
-        Self { cfg }
-    }
-
-    /// 选主战场：best_ask < 阈值的一侧，两侧皆满足取更便宜者；都不满足 None。
-    pub fn select_main_field(&self, market: &MarketSnapshot) -> Option<Side> {
-        let threshold = self.cfg.main_field_max_ask;
-        let up = market.book(Side::Up).best_ask.filter(|&a| a < threshold);
-        let down = market.book(Side::Down).best_ask.filter(|&a| a < threshold);
-        match (up, down) {
-            (Some(u), Some(d)) => Some(if u <= d { Side::Up } else { Side::Down }),
-            (Some(_), None) => Some(Side::Up),
-            (None, Some(_)) => Some(Side::Down),
-            (None, None) => None,
+    pub fn decide(&self, ctx: &DecisionContext) -> Decision {
+        // 到时间了 → 跳转 Cycling。
+        if ctx.progress >= ctx.config.building_end {
+            return Decision {
+                commands: vec![],
+                transition: Some(Phase::Cycling),
+            };
         }
-    }
 
-    /// 单档股数 = 池总额 × 占比 ÷ 挂单价。
-    fn rung_qty(&self, grid_maker_total: Money, pool_fraction: Decimal, price: Price) -> Qty {
-        grid_maker_total * pool_fraction / price
+        let mut commands = Vec::new();
+
+        // 两侧各最多保持一个活跃 Maker 买单。没有就挂。
+        let (cheap_side, expensive_side) = cheaper_side(ctx);
+
+        // 优先便宜侧。
+        for &side in &[cheap_side, expensive_side] {
+            if has_active_buy(ctx.active_orders, side) {
+                continue;
+            }
+            if let Some(cmd) = make_buy_intent(ctx, side) {
+                commands.push(cmd);
+            }
+        }
+
+        Decision {
+            commands,
+            transition: None,
+        }
     }
 }
 
-impl PhaseStrategy for BuildingStrategy {
-    fn decide(&self, ctx: &DecisionContext) -> Decision {
-        // 已有任意持仓 → 首笔成交发生过 → 跳配对态。
-        if ctx.position.up_qty > Qty::ZERO || ctx.position.down_qty > Qty::ZERO {
-            return Decision::transition(RobotState::Pairing);
-        }
+/// 判断某侧是否已有活跃买单。
+fn has_active_buy(orders: &[ActiveOrder], side: Side) -> bool {
+    orders
+        .iter()
+        .any(|o| o.side == side && o.direction == OrderDirection::Buy)
+}
 
-        // 已经铺了单还没成交 → 等着，别重复铺。
-        if !ctx.active_orders.is_empty() {
-            return Decision::skip();
-        }
+/// 构造一笔 Maker 买单意图：在该侧 bid 价挂 lot_qty。
+/// 盘口无 bid 时不挂（无法定价）。
+fn make_buy_intent(ctx: &DecisionContext, side: Side) -> Option<CommandIntent> {
+    let bid = ctx.market.book(side).best_bid?;
+    let price = ctx.constraints.quantize_price(bid);
+    let qty = ctx.config.lot_qty;
+    let notional = price * qty;
 
-        // 选主战场；选不出（无便宜侧）→ 这一 tick 空过。
-        let Some(side) = self.select_main_field(&ctx.market) else {
-            return Decision::skip();
-        };
-        let best_ask = match ctx.market.book(side).best_ask {
-            Some(a) => a,
-            None => return Decision::skip(),
-        };
+    // 现金不够则不挂。
+    if notional > ctx.free_cash {
+        return None;
+    }
 
-        // 铺三档，价格向下取整、股数向下量化后校验最小量，不够的档跳过。
-        let mut decision = Decision::skip();
-        for rung in &self.cfg.building_rungs {
-            let price = ctx.constraints.quantize_price(best_ask - rung.price_offset);
-            if price <= Price::ZERO {
-                continue;
-            }
-            let qty = ctx.constraints.quantize_qty(self.rung_qty(
-                ctx.pools.grid_maker_total,
-                rung.pool_fraction,
-                price,
-            ));
-            if !ctx.constraints.is_satisfied(qty, price) {
-                continue;
-            }
-            decision = decision.with(CommandIntent::Submit(OrderIntent::maker_buy(
-                side, price, qty,
-            )));
-        }
-        decision
+    Some(CommandIntent::SubmitBuy {
+        side,
+        price,
+        qty,
+        role: OrderRole::Maker,
+        tif: TimeInForce::Gtc,
+    })
+}
+
+/// 哪边更便宜（bid 更低的先买）。两边一样则 UP 优先。
+fn cheaper_side(ctx: &DecisionContext) -> (Side, Side) {
+    let up_bid = ctx.market.book(Side::Up).best_bid;
+    let dn_bid = ctx.market.book(Side::Down).best_bid;
+    match (up_bid, dn_bid) {
+        (Some(u), Some(d)) if d < u => (Side::Down, Side::Up),
+        _ => (Side::Up, Side::Down),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::{ActiveOrder, PoolBudgets, Trigger};
-    use domain::market::BookTop;
-    use domain::order::{OrderConstraints, OrderDirection, OrderId};
-    use domain::pnl::PositionSnapshot;
-    use domain::types::OrderRole;
+    use crate::config::StrategyConfig;
+    use domain::market::{BookTop, MarketSnapshot};
+    use domain::order::OrderConstraints;
+    use inventory::Inventory;
     use rust_decimal_macros::dec;
+    use std::sync::LazyLock;
 
-    fn book(bid: Option<Price>, ask: Option<Price>) -> BookTop {
-        BookTop {
-            best_bid: bid,
-            best_ask: ask,
-            last_trade: None,
-        }
-    }
+    static DEFAULT_CFG: LazyLock<StrategyConfig> = LazyLock::new(StrategyConfig::default);
 
-    use domain::round_state::RoundState;
-
-    struct Ctx {
+    fn basic_ctx<'a>(
+        progress: rust_decimal::Decimal,
+        inventory: &'a Inventory,
+        active_orders: &'a [ActiveOrder],
         market: MarketSnapshot,
-        position: PositionSnapshot,
-        active: Vec<ActiveOrder>,
-        round: RoundState,
+    ) -> DecisionContext<'a> {
+        DecisionContext {
+            trigger: crate::context::Trigger::BookUpdate,
+            progress,
+            market,
+            inventory,
+            active_orders,
+            free_cash: dec!(1000),
+            constraints: OrderConstraints::default(),
+            config: &DEFAULT_CFG,
+        }
     }
 
-    impl Ctx {
-        fn new(
-            market: MarketSnapshot,
-            position: PositionSnapshot,
-            active: Vec<ActiveOrder>,
-        ) -> Self {
-            Self {
-                market,
-                position,
-                active,
-                round: RoundState::new(),
+    fn market(
+        up_bid: Option<rust_decimal::Decimal>,
+        dn_bid: Option<rust_decimal::Decimal>,
+    ) -> MarketSnapshot {
+        MarketSnapshot {
+            up: BookTop {
+                best_bid: up_bid,
+                best_ask: up_bid.map(|b| b + dec!(0.01)),
+                last_trade: None,
+            },
+            down: BookTop {
+                best_bid: dn_bid,
+                best_ask: dn_bid.map(|b| b + dec!(0.01)),
+                last_trade: None,
+            },
+        }
+    }
+
+    #[test]
+    fn submits_buy_on_both_sides() {
+        let inv = Inventory::new();
+        let ctx = basic_ctx(
+            dec!(0.02),
+            &inv,
+            &[],
+            market(Some(dec!(0.55)), Some(dec!(0.44))),
+        );
+        let strategy = BuildingStrategy;
+        let decision = strategy.decide(&ctx);
+
+        // 两侧各一笔买单。
+        assert_eq!(decision.commands.len(), 2);
+        // 便宜侧（DN 0.44）先挂。
+        match decision.commands[0] {
+            CommandIntent::SubmitBuy { side, price, .. } => {
+                assert_eq!(side, Side::Down);
+                assert_eq!(price, dec!(0.44));
             }
-        }
-
-        fn build(&self) -> DecisionContext<'_> {
-            DecisionContext {
-                total_capital: dec!(1000),
-                trigger: Trigger::BookUpdate,
-                now: 0,
-                time_to_expiry: 600_000,
-                position: self.position,
-                market: self.market,
-                pools: PoolBudgets {
-                    grid_maker_total: dec!(150),
-                    grid_maker_remaining: dec!(150),
-                    dynamic_remaining: dec!(225),
-                    ev_remaining: dec!(375),
-                    max_exposure: dec!(112.5),
-                },
-                active_orders: &self.active,
-                constraints: OrderConstraints::default(),
-                round: &self.round,
-            }
-        }
-    }
-
-    fn empty_pos() -> PositionSnapshot {
-        PositionSnapshot {
-            up_qty: dec!(0),
-            down_qty: dec!(0),
-            up_cost: dec!(0),
-            down_cost: dec!(0),
-        }
-    }
-
-    fn strat() -> BuildingStrategy {
-        BuildingStrategy::new(StrategyConfig::default())
-    }
-
-    #[test]
-    fn selects_cheaper_side_below_threshold() {
-        let s = strat();
-        let market = MarketSnapshot {
-            up: book(Some(dec!(0.39)), Some(dec!(0.40))),
-            down: book(Some(dec!(0.59)), Some(dec!(0.60))),
-        };
-        assert_eq!(s.select_main_field(&market), Some(Side::Up));
-    }
-
-    #[test]
-    fn selects_down_when_down_cheaper() {
-        let s = strat();
-        let market = MarketSnapshot {
-            up: book(Some(dec!(0.59)), Some(dec!(0.60))),
-            down: book(Some(dec!(0.39)), Some(dec!(0.40))),
-        };
-        assert_eq!(s.select_main_field(&market), Some(Side::Down));
-    }
-
-    #[test]
-    fn no_main_field_when_neither_below_threshold() {
-        let s = strat();
-        let market = MarketSnapshot {
-            up: book(Some(dec!(0.55)), Some(dec!(0.56))),
-            down: book(Some(dec!(0.55)), Some(dec!(0.56))),
-        };
-        assert_eq!(s.select_main_field(&market), None);
-    }
-
-    #[test]
-    fn deploys_three_rungs_on_empty_book() {
-        let market = MarketSnapshot {
-            up: book(Some(dec!(0.39)), Some(dec!(0.40))),
-            down: book(Some(dec!(0.59)), Some(dec!(0.60))),
-        };
-        let c = Ctx::new(market, empty_pos(), vec![]);
-        let d = strat().decide(&c.build());
-        // 三档都满足最小量 → 三条 Submit。
-        assert_eq!(d.commands.len(), 3);
-        // 价格依次为 0.39/0.38/0.37（ask 0.40 减 0.01/0.02/0.03）。
-        for (i, expected_price) in [dec!(0.39), dec!(0.38), dec!(0.37)].iter().enumerate() {
-            match &d.commands[i] {
-                CommandIntent::Submit(o) => {
-                    assert_eq!(o.price, *expected_price);
-                    assert_eq!(o.side, Side::Up);
-                    assert_eq!(o.role, OrderRole::Maker);
-                }
-                _ => panic!("应为 Submit"),
-            }
+            _ => panic!("应为 SubmitBuy"),
         }
     }
 
     #[test]
-    fn transitions_to_pairing_when_position_exists() {
-        let market = MarketSnapshot {
-            up: book(Some(dec!(0.39)), Some(dec!(0.40))),
-            down: BookTop::default(),
-        };
-        let pos = PositionSnapshot {
-            up_qty: dec!(10),
-            down_qty: dec!(0),
-            up_cost: dec!(4),
-            down_cost: dec!(0),
-        };
-        let c = Ctx::new(market, pos, vec![]);
-        let d = strat().decide(&c.build());
-        assert_eq!(d.transition, Some(RobotState::Pairing));
-    }
-
-    #[test]
-    fn does_not_redeploy_when_orders_active() {
-        let market = MarketSnapshot {
-            up: book(Some(dec!(0.39)), Some(dec!(0.40))),
-            down: BookTop::default(),
-        };
-        let active = [ActiveOrder {
-            order_id: OrderId(1),
+    fn skips_side_with_existing_buy() {
+        let inv = Inventory::new();
+        let existing = vec![ActiveOrder {
+            order_id: domain::order::OrderId(1),
             side: Side::Up,
             direction: OrderDirection::Buy,
-            price: dec!(0.39),
+            price: dec!(0.50),
             qty: dec!(10),
             role: OrderRole::Maker,
+            lot_id: None,
         }];
-        let c = Ctx::new(market, empty_pos(), active.to_vec());
-        let d = strat().decide(&c.build());
-        assert!(d.is_skip());
+        let ctx = basic_ctx(
+            dec!(0.02),
+            &inv,
+            &existing,
+            market(Some(dec!(0.55)), Some(dec!(0.44))),
+        );
+        let strategy = BuildingStrategy;
+        let decision = strategy.decide(&ctx);
+
+        // UP 已有买单，只挂 DN。
+        assert_eq!(decision.commands.len(), 1);
+        match decision.commands[0] {
+            CommandIntent::SubmitBuy { side, .. } => assert_eq!(side, Side::Down),
+            _ => panic!("应为 SubmitBuy"),
+        }
     }
 
     #[test]
-    fn skips_when_no_main_field() {
-        let market = MarketSnapshot {
-            up: book(Some(dec!(0.55)), Some(dec!(0.56))),
-            down: book(Some(dec!(0.55)), Some(dec!(0.56))),
+    fn transitions_to_cycling_when_progress_reaches_threshold() {
+        let inv = Inventory::new();
+        let ctx = basic_ctx(
+            dec!(0.08),
+            &inv,
+            &[],
+            market(Some(dec!(0.50)), Some(dec!(0.50))),
+        );
+        let strategy = BuildingStrategy;
+        let decision = strategy.decide(&ctx);
+
+        assert_eq!(decision.transition, Some(Phase::Cycling));
+        assert!(decision.commands.is_empty());
+    }
+
+    #[test]
+    fn no_buy_when_insufficient_cash() {
+        let inv = Inventory::new();
+        let ctx = DecisionContext {
+            trigger: crate::context::Trigger::BookUpdate,
+            progress: dec!(0.02),
+            market: market(Some(dec!(0.50)), Some(dec!(0.50))),
+            inventory: &inv,
+            active_orders: &[],
+            free_cash: dec!(3), // 0.50 × 10 = 5 > 3
+            constraints: OrderConstraints::default(),
+            config: &DEFAULT_CFG,
         };
-        let c = Ctx::new(market, empty_pos(), vec![]);
-        let d = strat().decide(&c.build());
-        assert!(d.is_skip());
+        let strategy = BuildingStrategy;
+        let decision = strategy.decide(&ctx);
+        assert!(decision.commands.is_empty());
     }
 }

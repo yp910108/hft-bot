@@ -582,6 +582,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "strategy"
+version = "0.1.0"
+dependencies = [
+ "domain",
+ "inventory",
+ "rust_decimal",
+ "rust_decimal_macros",
+]
+
+[[package]]
 name = "syn"
 version = "1.0.109"
 source = "registry+https://github.com/rust-lang/crates.io-index"
