@@ -5,13 +5,12 @@ edition = "2024"
 
 [dependencies]
 domain = { path = "../domain" }
-ledger = { path = "../ledger" }
-fsm = { path = "../fsm" }
+inventory = { path = "../inventory" }
 strategy = { path = "../strategy" }
-risk = { path = "../risk" }
 exchange = { path = "../exchange" }
 rust_decimal = { workspace = true }
 rust_decimal_macros = { workspace = true }
 
 [dev-dependencies]
 rust_decimal_macros = { workspace = true }
+tokio = { workspace = true }
