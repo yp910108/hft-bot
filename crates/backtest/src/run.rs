@@ -9,14 +9,43 @@ use crate::market::Market;
 use domain::clock::Millis;
 use domain::command::Command;
 use domain::fee::FeeModel;
+use domain::order::OrderDirection;
 use domain::phase::Phase;
-use domain::types::{Money, Side};
+use domain::types::{Money, OrderRole, Price, Qty, Side};
 use engine::Engine;
 use engine::config::EngineConfig;
 use exchange::backend::ExchangeBackend;
 use exchange::event::ExchangeEvent;
 use exchange::simulator::Simulator;
 use rust_decimal::Decimal;
+
+/// 一笔成交记录，供报告逐笔展示。携带成交后从 engine 快照的真实持仓，报告零重算。
+#[derive(Debug, Clone)]
+pub struct FillRecord {
+    /// 场内秒数。
+    pub second: u64,
+    /// 成交侧。
+    pub side: Side,
+    /// 买入 / 卖出。
+    pub direction: OrderDirection,
+    /// Maker / Taker。
+    pub role: OrderRole,
+    /// 成交价。
+    pub price: Price,
+    /// 成交股数（买入=净入仓，卖出=减仓）。
+    pub size: Qty,
+    // ── 成交后 engine 真实快照 ──
+    /// 成交后 UP 净持仓。
+    pub up_qty: Qty,
+    /// 成交后 UP 净成本。
+    pub up_cost: Money,
+    /// 成交后 DN 净持仓。
+    pub dn_qty: Qty,
+    /// 成交后 DN 净成本。
+    pub dn_cost: Money,
+    /// 成交后累计已实现盈亏。
+    pub realized: Money,
+}
 
 /// 一场回测的结果。
 #[derive(Debug, Clone)]
@@ -37,8 +66,12 @@ pub struct MatchResult {
     pub fills: u32,
     /// UP 侧净持仓。
     pub up_net_qty: Money,
+    /// UP 侧净持仓成本。
+    pub up_net_cost: Money,
     /// DN 侧净持仓。
     pub dn_net_qty: Money,
+    /// DN 侧净持仓成本。
+    pub dn_net_cost: Money,
     /// 最终 sum_avg。
     pub sum_avg: Money,
 }
@@ -48,6 +81,27 @@ const TICK_MS: Millis = 1_000;
 
 /// 跑一整场回测。
 pub fn run_match(market: &Market, cfg: EngineConfig, fee: FeeModel) -> MatchResult {
+    run_core(market, cfg, fee, None)
+}
+
+/// 跑一整场回测并记录逐笔成交（供 HTML 报告用）。
+pub fn run_match_recorded(
+    market: &Market,
+    cfg: EngineConfig,
+    fee: FeeModel,
+) -> (MatchResult, Vec<FillRecord>) {
+    let mut records = Vec::new();
+    let result = run_core(market, cfg, fee, Some(&mut records));
+    (result, records)
+}
+
+/// 回测核心循环。`recorder` 为 Some 时记录每笔成交。
+fn run_core(
+    market: &Market,
+    cfg: EngineConfig,
+    fee: FeeModel,
+    mut recorder: Option<&mut Vec<FillRecord>>,
+) -> MatchResult {
     let mut engine = Engine::new(cfg);
     let (mut sim, mut rx) = Simulator::new(fee);
     let n = market.snapshots.len() as u64;
@@ -56,6 +110,7 @@ pub fn run_match(market: &Market, cfg: EngineConfig, fee: FeeModel) -> MatchResu
     for (i, snapshot) in market.snapshots.iter().enumerate() {
         let now: Millis = (i as u64 + 1) * TICK_MS;
         let tte: Millis = n.saturating_sub(i as u64 + 1) * TICK_MS;
+        let second = i as u64 + 1;
 
         // ① 喂行情给 Simulator，驱动挂单撮合。
         sim.on_market(snapshot);
@@ -63,10 +118,8 @@ pub fn run_match(market: &Market, cfg: EngineConfig, fee: FeeModel) -> MatchResu
         // ② drain 事件 → engine 入账 → 收集指令（不立刻 dispatch，防止自我喂食循环）。
         let mut pending_cmds: Vec<Command> = Vec::new();
         while let Ok(event) = rx.try_recv() {
-            if matches!(&event, ExchangeEvent::Filled(_)) {
-                fills += 1;
-            }
             let cmds = engine.handle_event(&event, now, tte);
+            record_fill(&mut recorder, &engine, &event, second, &mut fills);
             pending_cmds.extend(cmds);
         }
         // 统一 dispatch（可能产出新事件，但留给下一步处理）。
@@ -82,10 +135,8 @@ pub fn run_match(market: &Market, cfg: EngineConfig, fee: FeeModel) -> MatchResu
 
         // ④ 处理 ②③ dispatch 产出的新事件（只入账收集指令，再统一 dispatch 一轮）。
         while let Ok(event) = rx.try_recv() {
-            if matches!(&event, ExchangeEvent::Filled(_)) {
-                fills += 1;
-            }
             let cmds = engine.handle_event(&event, now, tte);
+            record_fill(&mut recorder, &engine, &event, second, &mut fills);
             pending_cmds.extend(cmds);
         }
         for cmd in pending_cmds {
@@ -109,12 +160,45 @@ pub fn run_match(market: &Market, cfg: EngineConfig, fee: FeeModel) -> MatchResu
         winner: market.winner,
         fills,
         up_net_qty: snapshot.up_qty,
+        up_net_cost: snapshot.up_cost,
         dn_net_qty: snapshot.down_qty,
+        dn_net_cost: snapshot.down_cost,
         sum_avg: if snapshot.up_qty > Decimal::ZERO && snapshot.down_qty > Decimal::ZERO {
             inv.sum_avg()
         } else {
             Decimal::ZERO
         },
+    }
+}
+
+/// 成交事件：计数，并在开启记录时追加一条 FillRecord（携带成交后 engine 真实快照）。
+/// 必须在 `engine.handle_event` 之后调用，此时 engine 已入账。
+fn record_fill(
+    recorder: &mut Option<&mut Vec<FillRecord>>,
+    engine: &Engine,
+    event: &ExchangeEvent,
+    second: u64,
+    fills: &mut u32,
+) {
+    let ExchangeEvent::Filled(fill) = event else {
+        return;
+    };
+    *fills += 1;
+    if let Some(records) = recorder {
+        let inv = engine.inventory();
+        records.push(FillRecord {
+            second,
+            side: fill.side,
+            direction: fill.direction,
+            role: fill.role,
+            price: fill.price,
+            size: fill.filled_qty,
+            up_qty: inv.net_qty(Side::Up),
+            up_cost: inv.net_cost(Side::Up),
+            dn_qty: inv.net_qty(Side::Down),
+            dn_cost: inv.net_cost(Side::Down),
+            realized: inv.realized_pnl(),
+        });
     }
 }
 

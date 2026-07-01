@@ -10,4 +10,5 @@ engine = { path = "../engine" }
 inventory = { path = "../inventory" }
 rust_decimal = { workspace = true }
 rust_decimal_macros = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true }
