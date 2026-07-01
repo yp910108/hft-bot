@@ -160,9 +160,16 @@ impl OrderConstraints {
         qty >= self.min_order_size && qty * price >= self.min_notional
     }
 
-    /// 将价格向下量化到允许的精度（买单向下取整不会抬高买价）。
+    /// 将买单价格向下量化到允许的精度（向下取整不会抬高买价）。
     pub fn quantize_price(&self, price: Price) -> Price {
         price.round_dp_with_strategy(self.price_scale, RoundingStrategy::ToZero)
+    }
+
+    /// 将卖单价格向上量化到允许的精度（向上取整不会降低卖价）。
+    ///
+    /// 卖单挂高价止盈，量化方向与买单相反：向上取整保证不会因舍入吃亏。
+    pub fn quantize_price_up(&self, price: Price) -> Price {
+        price.round_dp_with_strategy(self.price_scale, RoundingStrategy::AwayFromZero)
     }
 
     /// 将份数向下量化到允许的精度（向下取整不会超出预算）。
@@ -282,5 +289,16 @@ mod tests {
         // 价格 3 位、数量 0 位（整数份）。
         assert_eq!(constraints.quantize_price(dec!(0.12349)), dec!(0.123));
         assert_eq!(constraints.quantize_qty(dec!(7.9)), dec!(7));
+    }
+
+    #[test]
+    fn quantize_price_up_rounds_up_to_two_decimals() {
+        let constraints = OrderConstraints::default();
+        // 0.4501 向上量化到 2 位 → 0.46（不降低卖价）。
+        assert_eq!(constraints.quantize_price_up(dec!(0.4501)), dec!(0.46));
+        // 已是 2 位则不变。
+        assert_eq!(constraints.quantize_price_up(dec!(0.45)), dec!(0.45));
+        // 0.4500 精确 2 位，不变。
+        assert_eq!(constraints.quantize_price_up(dec!(0.4500)), dec!(0.45));
     }
 }
