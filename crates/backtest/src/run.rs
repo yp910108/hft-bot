@@ -60,32 +60,36 @@ pub fn run_match(market: &Market, cfg: EngineConfig, fee: FeeModel) -> MatchResu
         // ① 喂行情给 Simulator，驱动挂单撮合。
         sim.on_market(snapshot);
 
-        // ② 处理 Simulator 产出的 Fill/Canceled 事件。
+        // ② drain 事件 → engine 入账 → 收集指令（不立刻 dispatch，防止自我喂食循环）。
+        let mut pending_cmds: Vec<Command> = Vec::new();
         while let Ok(event) = rx.try_recv() {
             if matches!(&event, ExchangeEvent::Filled(_)) {
                 fills += 1;
             }
             let cmds = engine.handle_event(&event, now, tte);
-            for cmd in cmds {
-                dispatch(&mut sim, &cmd);
-            }
+            pending_cmds.extend(cmds);
+        }
+        // 统一 dispatch（可能产出新事件，但留给下一步处理）。
+        for cmd in pending_cmds.drain(..) {
+            dispatch(&mut sim, &cmd);
         }
 
         // ③ BookUpdate 事件喂 Engine，产出决策指令。
         let cmds = engine.handle_event(&ExchangeEvent::BookUpdate(*snapshot), now, tte);
-        for cmd in cmds {
-            dispatch(&mut sim, &cmd);
+        for cmd in &cmds {
+            dispatch(&mut sim, cmd);
         }
 
-        // ④ BookUpdate 后 Simulator 可能有新成交（刚提交的 Taker 单）。
+        // ④ 处理 ②③ dispatch 产出的新事件（只入账收集指令，再统一 dispatch 一轮）。
         while let Ok(event) = rx.try_recv() {
             if matches!(&event, ExchangeEvent::Filled(_)) {
                 fills += 1;
             }
             let cmds = engine.handle_event(&event, now, tte);
-            for cmd in cmds {
-                dispatch(&mut sim, &cmd);
-            }
+            pending_cmds.extend(cmds);
+        }
+        for cmd in pending_cmds {
+            dispatch(&mut sim, &cmd);
         }
     }
 
