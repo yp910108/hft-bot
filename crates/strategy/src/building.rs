@@ -34,6 +34,10 @@ impl BuildingStrategy {
             if has_active_buy(ctx.active_orders, side) {
                 continue;
             }
+            // 第二版库存约束。
+            if !crate::cycling::inventory_allows_buy(ctx, side) {
+                continue;
+            }
             if let Some(cmd) = make_buy_intent(ctx, side) {
                 commands.push(cmd);
             }

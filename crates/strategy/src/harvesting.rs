@@ -36,22 +36,16 @@ impl HarvestingStrategy {
                     continue;
                 }
 
-                let Some(bid) = ctx.market.book(side).best_bid else {
-                    continue;
-                };
-
                 let target_price = lot.buy_price + tp;
-                if bid >= target_price {
-                    let price = ctx.constraints.quantize_price_up(target_price);
-                    commands.push(CommandIntent::SubmitSell {
-                        lot_id: lot.lot_id,
-                        side,
-                        price,
-                        qty: lot.qty,
-                        role: OrderRole::Maker,
-                        tif: TimeInForce::Gtc,
-                    });
-                }
+                let price = ctx.constraints.quantize_price_up(target_price);
+                commands.push(CommandIntent::SubmitSell {
+                    lot_id: lot.lot_id,
+                    side,
+                    price,
+                    qty: lot.qty,
+                    role: OrderRole::Maker,
+                    tif: TimeInForce::Gtc,
+                });
             }
         }
 

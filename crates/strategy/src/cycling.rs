@@ -29,6 +29,8 @@ impl CyclingStrategy {
         let sl = ctx.config.sl(ctx.progress);
 
         // ── 止盈扫描 ──
+        // 0xe00740bc 的做法：买入成交后立即在 buy_price+tp 挂好 Maker 卖单等人来吃，
+        // 不等 bid 涨到位才挂。所以只要 Lot 没有对应的止盈卖单就立刻挂。
         for side in [Side::Up, Side::Down] {
             for lot in ctx.inventory.open_lots(side) {
                 // 已有卖单绑定此 Lot → 跳过。
@@ -36,24 +38,16 @@ impl CyclingStrategy {
                     continue;
                 }
 
-                let Some(bid) = ctx.market.book(side).best_bid else {
-                    continue;
-                };
-
                 let target_price = lot.buy_price + tp;
-
-                if bid >= target_price {
-                    // bid 已穿越止盈线 → 挂 Maker 卖单在 target_price。
-                    let price = ctx.constraints.quantize_price_up(target_price);
-                    commands.push(CommandIntent::SubmitSell {
-                        lot_id: lot.lot_id,
-                        side,
-                        price,
-                        qty: lot.qty,
-                        role: OrderRole::Maker,
-                        tif: TimeInForce::Gtc,
-                    });
-                }
+                let price = ctx.constraints.quantize_price_up(target_price);
+                commands.push(CommandIntent::SubmitSell {
+                    lot_id: lot.lot_id,
+                    side,
+                    price,
+                    qty: lot.qty,
+                    role: OrderRole::Maker,
+                    tif: TimeInForce::Gtc,
+                });
             }
         }
 
@@ -90,6 +84,10 @@ impl CyclingStrategy {
             if has_active_buy(ctx.active_orders, side) {
                 continue;
             }
+            // 第二版库存约束：单侧超上限、或加重不平衡时，跳过该侧买入。
+            if !inventory_allows_buy(ctx, side) {
+                continue;
+            }
             if let Some(cmd) = make_buy_intent(ctx, side) {
                 commands.push(cmd);
             }
@@ -100,6 +98,33 @@ impl CyclingStrategy {
             transition: None,
         }
     }
+}
+
+/// 第二版库存约束：判断某侧现在是否还允许买入。
+///
+/// 两道闸（任一未配置则该闸不生效）：
+/// - 单侧净持仓 ≥ inventory_cap → 禁买该侧。
+/// - 买该侧会加重不平衡且差额已达 imbalance_cap → 禁买该侧。
+pub(crate) fn inventory_allows_buy(ctx: &DecisionContext, side: Side) -> bool {
+    let net = ctx.inventory.net_qty(side);
+
+    // 闸 1：单侧持仓上限。
+    if let Some(cap) = ctx.config.inventory_cap
+        && net >= cap
+    {
+        return false;
+    }
+
+    // 闸 2：双侧不平衡上限。买重侧会加重失衡。
+    if let Some(cap) = ctx.config.imbalance_cap {
+        let other = ctx.inventory.net_qty(side.opposite());
+        // 该侧已是重侧（或持平）且差额达上限 → 禁买该侧。
+        if net >= other && (net - other) >= cap {
+            return false;
+        }
+    }
+
+    true
 }
 
 /// 某 Lot 是否已有对应的止盈卖单挂着。
@@ -246,11 +271,11 @@ mod tests {
     }
 
     #[test]
-    fn does_not_submit_sell_when_bid_below_threshold() {
+    fn submits_sell_immediately_regardless_of_bid() {
         let mut inv = Inventory::new();
-        inv.open_lot(Side::Up, dec!(0.40), dec!(10), dec!(4.00), 100);
+        let lot_id = inv.open_lot(Side::Up, dec!(0.40), dec!(10), dec!(4.00), 100);
 
-        // UP bid = 0.44 < 0.40 + 0.05 = 0.45 → 不触发止盈。
+        // UP bid = 0.44 < buy_price+tp = 0.45，但新逻辑不看 bid，立刻挂。
         let market = make_market(dec!(0.44), dec!(0.54));
         let ctx = ctx_with_inventory(&inv, &[], market, dec!(0.10));
         let strategy = CyclingStrategy;
@@ -269,7 +294,14 @@ mod tests {
                 )
             })
             .collect();
-        assert!(sell_cmds.is_empty());
+        assert_eq!(sell_cmds.len(), 1);
+        match sell_cmds[0] {
+            CommandIntent::SubmitSell { lot_id: id, price, .. } => {
+                assert_eq!(*id, lot_id);
+                assert_eq!(*price, dec!(0.45)); // buy_price + tp
+            }
+            _ => panic!("应为 SubmitSell"),
+        }
     }
 
     #[test]
@@ -393,5 +425,72 @@ mod tests {
             .collect();
         // 两侧各一笔。
         assert_eq!(buy_cmds.len(), 2);
+    }
+
+    #[test]
+    fn inventory_cap_blocks_buy_when_side_full() {
+        let mut inv = Inventory::new();
+        // UP 已持仓 200 股。
+        inv.open_lot(Side::Up, dec!(0.45), dec!(200), dec!(90.00), 100);
+
+        let cfg = StrategyConfig {
+            inventory_cap: Some(dec!(200)),
+            ..StrategyConfig::default()
+        };
+        let market = make_market(dec!(0.44), dec!(0.54));
+        let ctx = DecisionContext {
+            trigger: Trigger::BookUpdate,
+            progress: dec!(0.20),
+            market,
+            inventory: &inv,
+            active_orders: &[],
+            free_cash: dec!(1000),
+            constraints: OrderConstraints::default(),
+            config: &cfg,
+        };
+        // UP 净持仓 200 ≥ cap 200 → 不允许买 UP。
+        assert!(!inventory_allows_buy(&ctx, Side::Up));
+        // DN 空仓 → 允许买 DN。
+        assert!(inventory_allows_buy(&ctx, Side::Down));
+    }
+
+    #[test]
+    fn imbalance_cap_blocks_heavier_side() {
+        let mut inv = Inventory::new();
+        // UP 150 股，DN 40 股，差额 110。
+        inv.open_lot(Side::Up, dec!(0.45), dec!(150), dec!(67.50), 100);
+        inv.open_lot(Side::Down, dec!(0.55), dec!(40), dec!(22.00), 200);
+
+        let cfg = StrategyConfig {
+            imbalance_cap: Some(dec!(100)),
+            ..StrategyConfig::default()
+        };
+        let market = make_market(dec!(0.44), dec!(0.54));
+        let ctx = DecisionContext {
+            trigger: Trigger::BookUpdate,
+            progress: dec!(0.20),
+            market,
+            inventory: &inv,
+            active_orders: &[],
+            free_cash: dec!(1000),
+            constraints: OrderConstraints::default(),
+            config: &cfg,
+        };
+        // UP 是重侧，差额 110 ≥ 100 → 禁买 UP。
+        assert!(!inventory_allows_buy(&ctx, Side::Up));
+        // DN 是轻侧 → 允许买 DN（再平衡）。
+        assert!(inventory_allows_buy(&ctx, Side::Down));
+    }
+
+    #[test]
+    fn no_caps_allows_all_buys() {
+        let mut inv = Inventory::new();
+        inv.open_lot(Side::Up, dec!(0.45), dec!(500), dec!(225.00), 100);
+
+        // 默认配置无 cap。
+        let market = make_market(dec!(0.44), dec!(0.54));
+        let ctx = ctx_with_inventory(&inv, &[], market, dec!(0.20));
+        assert!(inventory_allows_buy(&ctx, Side::Up));
+        assert!(inventory_allows_buy(&ctx, Side::Down));
     }
 }
