@@ -44,10 +44,17 @@ impl SideInventory {
         self.lots.push(lot);
     }
 
-    /// 按 lot_id 找到并全额平仓，返回被平的 Lot。找不到返回 None。
-    fn close(&mut self, lot_id: LotId) -> Option<Lot> {
-        let pos = self.lots.iter().position(|l| l.lot_id == lot_id)?;
-        Some(self.lots.remove(pos))
+    /// 按 lot_id 减仓。全平时删除，部分平时减 qty。返回实际减掉的股数。找不到返回 0。
+    fn reduce(&mut self, lot_id: LotId, qty: Qty) -> Qty {
+        let Some(lot) = self.lots.iter_mut().find(|l| l.lot_id == lot_id) else {
+            return Decimal::ZERO;
+        };
+        let closed = qty.min(lot.qty);
+        lot.qty -= closed;
+        if lot.qty <= Decimal::ZERO {
+            self.lots.retain(|l| l.lot_id != lot_id);
+        }
+        closed
     }
 
     /// 某侧净持仓 = Σ lots.qty。
@@ -129,20 +136,30 @@ impl Inventory {
         lot_id
     }
 
-    /// 卖出成交 → 全额平掉指定 Lot，记录已实现盈亏。
+    /// 卖出成交 → 按实际成交量减仓，部分成交时 Lot 保留剩余股数。
     ///
-    /// - `sell_price`：卖出成交价（每股回收金额）。
-    /// - `cash_in_amount`：实际回收现金（卖 Maker 时 = sell_price×qty；卖 Taker 时扣费后金额）。
+    /// - `filled_qty`：本次实际成交股数。
+    /// - `cash_in_amount`：本次实际回收现金。
     ///
     /// 返回该笔已实现盈亏。找不到 Lot 返回 None。
     pub fn close_lot(
         &mut self,
         side: Side,
         lot_id: LotId,
+        filled_qty: Qty,
         cash_in_amount: Money,
     ) -> Option<Money> {
-        let lot = self.side_mut(side).close(lot_id)?;
-        let pnl = cash_in_amount - lot.cost();
+        // 先拿买入均价（减仓前算）。
+        let lot = self.side(side).lots.iter().find(|l| l.lot_id == lot_id)?;
+        let buy_price = lot.buy_price;
+        // 按实际成交量减仓。
+        let closed = self.side_mut(side).reduce(lot_id, filled_qty);
+        if closed <= Decimal::ZERO {
+            return None;
+        }
+        // 盈亏 = 回收现金 − 成交部分的成本基础。
+        let cost_portion = buy_price * closed;
+        let pnl = cash_in_amount - cost_portion;
         self.realized_pnl += pnl;
         self.cash_in += cash_in_amount;
         Some(pnl)
@@ -163,6 +180,11 @@ impl Inventory {
     /// 某侧净持仓均价。无持仓返回 None。
     pub fn net_avg(&self, side: Side) -> Option<Price> {
         self.side(side).net_avg()
+    }
+
+    /// 指定 Lot 是否还存在（未被全平）。
+    pub fn lot_exists(&self, side: Side, lot_id: LotId) -> bool {
+        self.side(side).lots.iter().any(|l| l.lot_id == lot_id)
     }
 
     /// sum_avg = UP 净均价 + DN 净均价。< 1 时双赢结构。
@@ -253,7 +275,7 @@ mod tests {
         let mut inv = Inventory::new();
         let id = inv.open_lot(Side::Up, dec!(0.45), dec!(10), dec!(4.50), 1000);
         // 卖出回收 $5.00（Maker 零费 @ 0.50 × 10 股）。
-        let pnl = inv.close_lot(Side::Up, id, dec!(5.00));
+        let pnl = inv.close_lot(Side::Up, id, dec!(10), dec!(5.00));
         // 盈亏 = 回收 5.00 − 成本 4.50 = +0.50。
         assert_eq!(pnl, Some(dec!(0.50)));
         assert_eq!(inv.realized_pnl(), dec!(0.50));
@@ -264,7 +286,7 @@ mod tests {
     #[test]
     fn close_lot_returns_none_for_unknown_id() {
         let mut inv = Inventory::new();
-        assert_eq!(inv.close_lot(Side::Up, LotId(99), dec!(5.00)), None);
+        assert_eq!(inv.close_lot(Side::Up, LotId(99), dec!(10), dec!(5.00)), None);
     }
 
     #[test]
@@ -311,9 +333,9 @@ mod tests {
         let id0 = inv.open_lot(Side::Up, dec!(0.40), dec!(10), dec!(4.00), 100);
         let id1 = inv.open_lot(Side::Up, dec!(0.42), dec!(10), dec!(4.20), 200);
         // 平 id0: 回收 $4.50 → pnl +0.50
-        inv.close_lot(Side::Up, id0, dec!(4.50));
+        inv.close_lot(Side::Up, id0, dec!(10), dec!(4.50));
         // 平 id1: 回收 $4.80 → pnl +0.60
-        inv.close_lot(Side::Up, id1, dec!(4.80));
+        inv.close_lot(Side::Up, id1, dec!(10), dec!(4.80));
         assert_eq!(inv.realized_pnl(), dec!(1.10)); // 0.50 + 0.60
     }
 
@@ -326,7 +348,7 @@ mod tests {
         assert_eq!(inv.net_invested(), dec!(10.00));
         // 卖出一笔 UP: 回收 5.00
         let id = LotId(0);
-        inv.close_lot(Side::Up, id, dec!(5.00));
+        inv.close_lot(Side::Up, id, dec!(10), dec!(5.00));
         assert_eq!(inv.net_invested(), dec!(5.00)); // 10 − 5
     }
 }

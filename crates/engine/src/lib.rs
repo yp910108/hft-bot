@@ -104,11 +104,15 @@ impl Engine {
                         let lot_id = self.book.lot_id_for(fill.order_id);
                         let mut cancels = vec![];
                         if let Some(lid) = lot_id
-                            && self.inventory.close_lot(fill.side, lid, fill.cash).is_some()
+                            && self.inventory.close_lot(fill.side, lid, fill.filled_qty, fill.cash).is_some()
                         {
-                            let stale_ids = self.book.remove_sells_for_lot(lid, fill.order_id);
-                            for id in stale_ids {
-                                cancels.push(Command::CancelOrder(id));
+                            // 只有 Lot 全平（qty 归零）时才清理冗余卖单。
+                            // 部分成交时 Lot 还在，不撤其他单。
+                            if !self.inventory.lot_exists(fill.side, lid) {
+                                let stale_ids = self.book.remove_sells_for_lot(lid, fill.order_id);
+                                for id in stale_ids {
+                                    cancels.push(Command::CancelOrder(id));
+                                }
                             }
                         }
                         self.book.apply_fill(fill.order_id, fill.filled_qty);
