@@ -32,15 +32,33 @@ impl BuildingStrategy {
 
         // 优先便宜侧。
         for &side in &[cheap_side, expensive_side] {
-            if has_active_buy(ctx.active_orders, side) {
-                continue;
-            }
             // 第二版库存约束。
             if !cycling::inventory_allows_buy(ctx, side) {
                 continue;
             }
-            if let Some(cmd) = make_buy_intent(ctx, side) {
-                commands.push(cmd);
+
+            let Some(bid) = ctx.market.book(side).best_bid else {
+                continue;
+            };
+
+            // 检查该侧是否已有买单。
+            let existing_buy = find_buy_order(ctx.active_orders, side);
+
+            if let Some(existing) = existing_buy {
+                // 已有买单：检查是否脱离盘口（挂单价比当前 bid 低超过 1 tick）。
+                if bid - existing.price > ctx.constraints.quantize_price(rust_decimal_macros::dec!(0.01)) {
+                    // 废单，撤掉后重挂。
+                    commands.push(CommandIntent::Cancel(existing.order_id));
+                    if let Some(cmd) = make_buy_intent(ctx, side) {
+                        commands.push(cmd);
+                    }
+                }
+                // 买单还在盘口附近，不动。
+            } else {
+                // 无买单，直接挂。
+                if let Some(cmd) = make_buy_intent(ctx, side) {
+                    commands.push(cmd);
+                }
             }
         }
 
@@ -51,11 +69,11 @@ impl BuildingStrategy {
     }
 }
 
-/// 判断某侧是否已有活跃买单。
-fn has_active_buy(orders: &[ActiveOrder], side: Side) -> bool {
+/// 找某侧的活跃买单（返回引用，用于检查价格偏差）。
+fn find_buy_order(orders: &[ActiveOrder], side: Side) -> Option<&ActiveOrder> {
     orders
         .iter()
-        .any(|o| o.side == side && o.direction == OrderDirection::Buy)
+        .find(|o| o.side == side && o.direction == OrderDirection::Buy)
 }
 
 /// 构造一笔 Maker 买单意图：在该侧 bid 价挂 lot_qty。
@@ -163,8 +181,9 @@ mod tests {
     }
 
     #[test]
-    fn skips_side_with_existing_buy() {
+    fn cancels_stale_buy_and_refreshes() {
         let inv = Inventory::new();
+        // UP 已有买单 @0.50，但当前 bid=0.55，偏差 0.05 > 0.01 → 撤旧挂新。
         let existing = vec![ActiveOrder {
             order_id: domain::order::OrderId(1),
             side: Side::Up,
@@ -183,7 +202,38 @@ mod tests {
         let strategy = BuildingStrategy;
         let decision = strategy.decide(&ctx);
 
-        // UP 已有买单，只挂 DN。
+        // UP 侧：Cancel(旧单) + SubmitBuy(新单@0.55)。DN 侧：SubmitBuy(@0.44)。
+        let cancels: Vec<_> = decision.commands.iter().filter(|c| matches!(c, CommandIntent::Cancel(_))).collect();
+        assert_eq!(cancels.len(), 1);
+        let buys: Vec<_> = decision.commands.iter().filter(|c| matches!(c, CommandIntent::SubmitBuy { .. })).collect();
+        assert_eq!(buys.len(), 2); // UP 新单 + DN 新单
+    }
+
+    #[test]
+    fn keeps_buy_when_still_near_bid() {
+        let inv = Inventory::new();
+        // UP 已有买单 @0.54，当前 bid=0.55，偏差 0.01 ≤ 阈值 → 不撤，只挂 DN。
+        let existing = vec![ActiveOrder {
+            order_id: domain::order::OrderId(1),
+            side: Side::Up,
+            direction: OrderDirection::Buy,
+            price: dec!(0.54),
+            qty: dec!(10),
+            role: OrderRole::Maker,
+            lot_id: None,
+        }];
+        let ctx = basic_ctx(
+            dec!(0.02),
+            &inv,
+            &existing,
+            market(Some(dec!(0.55)), Some(dec!(0.44))),
+        );
+        let strategy = BuildingStrategy;
+        let decision = strategy.decide(&ctx);
+
+        // 不撤 UP 旧单，只挂 DN。
+        let cancels: Vec<_> = decision.commands.iter().filter(|c| matches!(c, CommandIntent::Cancel(_))).collect();
+        assert!(cancels.is_empty());
         assert_eq!(decision.commands.len(), 1);
         match decision.commands[0] {
             CommandIntent::SubmitBuy { side, .. } => assert_eq!(side, Side::Down),

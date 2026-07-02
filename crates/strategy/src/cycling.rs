@@ -48,17 +48,27 @@ impl CyclingStrategy {
             }
         }
 
-        // ── 补买 ──
+        // ── 补买（紧贴盘口动态刷新） ──
         let (cheap, expensive) = cheaper_side(ctx);
         for &side in &[cheap, expensive] {
-            if has_active_buy(ctx.active_orders, side) {
-                continue;
-            }
-            // 第二版库存约束：单侧超上限、或加重不平衡时，跳过该侧买入。
             if !inventory_allows_buy(ctx, side) {
                 continue;
             }
-            if let Some(cmd) = make_buy_intent(ctx, side) {
+
+            let Some(bid) = ctx.market.book(side).best_bid else {
+                continue;
+            };
+
+            let existing_buy = find_buy_order(ctx.active_orders, side);
+
+            if let Some(existing) = existing_buy {
+                if bid - existing.price > rust_decimal_macros::dec!(0.01) {
+                    commands.push(CommandIntent::Cancel(existing.order_id));
+                    if let Some(cmd) = make_buy_intent(ctx, side) {
+                        commands.push(cmd);
+                    }
+                }
+            } else if let Some(cmd) = make_buy_intent(ctx, side) {
                 commands.push(cmd);
             }
         }
@@ -105,11 +115,11 @@ fn find_sell_for_lot(orders: &[ActiveOrder], lot_id: LotId) -> Option<domain::or
         .map(|o| o.order_id)
 }
 
-/// 某侧是否已有活跃买单。
-fn has_active_buy(orders: &[ActiveOrder], side: Side) -> bool {
+/// 找某侧的活跃买单。
+fn find_buy_order(orders: &[ActiveOrder], side: Side) -> Option<&ActiveOrder> {
     orders
         .iter()
-        .any(|o| o.side == side && o.direction == OrderDirection::Buy)
+        .find(|o| o.side == side && o.direction == OrderDirection::Buy)
 }
 
 /// 构造 Maker 买单：bid 价挂 lot_qty。现金不够或无 bid 时返回 None。
