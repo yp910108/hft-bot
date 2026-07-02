@@ -28,10 +28,23 @@ fn side_label(side: Side) -> &'static str {
     }
 }
 
-/// 把一笔真实成交转成报告 operation JSON。持仓/盈亏全用 FillRecord 里的 engine 真实快照，零重算。
+/// 展示层累计持仓：卖出 = 买对面，两侧只增不减，与 0xe00740bc 报告口径一致。
+#[derive(Default)]
+struct DisplayPosition {
+    up_qty: f64,
+    up_cost: f64,
+    dn_qty: f64,
+    dn_cost: f64,
+}
+
+/// 把一笔真实成交转成报告 operation JSON。
 ///
-/// 展示层：SELL X@p 显示为 BUY 对面@(1-p) 标 converted；持仓数字仍是真实净持仓。
-fn op_json(r: &FillRecord, start_hms: &str) -> Value {
+/// 把一笔真实成交转成报告 operation JSON。
+///
+/// 分两层，各取所需：
+/// - 持仓/成本/均价列：展示层口径（卖 X@p = 买对面@(1-p)，对面增长、本侧不动），可读性好。
+/// - 盈亏列 pnl_if_*：引擎真值（已实现盈亏 + 该侧真实净持仓结算），真金白银不含糊。
+fn op_json(r: &FillRecord, start_hms: &str, dp: &mut DisplayPosition) -> Value {
     let (disp_side, disp_price, converted, orig_dir, orig_price) = match r.direction {
         OrderDirection::Buy => (r.side, r.price, false, Value::Null, Value::Null),
         OrderDirection::Sell => (
@@ -43,31 +56,45 @@ fn op_json(r: &FillRecord, start_hms: &str) -> Value {
         ),
     };
 
-    let up_qty = f64v(r.up_qty);
-    let up_cost = f64v(r.up_cost);
-    let dn_qty = f64v(r.dn_qty);
-    let dn_cost = f64v(r.dn_cost);
-    let total_cost = up_cost + dn_cost;
+    // 展示层口径：所有操作都是"买入 disp_side"，累加该侧的持仓和成本，本侧不动。
+    let size = f64v(r.size);
+    let price = f64v(disp_price);
+    match disp_side {
+        Side::Up => {
+            dp.up_qty += size;
+            dp.up_cost += price * size;
+        }
+        Side::Down => {
+            dp.dn_qty += size;
+            dp.dn_cost += price * size;
+        }
+    }
+
+    let total_cost = dp.up_cost + dp.dn_cost;
+
+    // 盈亏用引擎真值：该时点若结算 = 已实现 + 真实净持仓×1 − 真实净持仓成本。
+    let real_total_cost = f64v(r.up_cost + r.dn_cost);
     let realized = f64v(r.realized);
+    let pnl_if_up = realized + f64v(r.up_qty) - real_total_cost;
+    let pnl_if_dn = realized + f64v(r.dn_qty) - real_total_cost;
 
     json!({
         "time": format!("{} +{:>3}s", start_hms, r.second),
         "direction": side_label(disp_side),
         "side": "BUY",
         "role": match r.role { domain::types::OrderRole::Maker => "Maker", domain::types::OrderRole::Taker => "Taker" },
-        "price": f64v(disp_price),
-        "size": f64v(r.size),
+        "price": price,
+        "size": size,
         "converted": converted,
         "orig_dir": orig_dir,
         "orig_price": orig_price,
-        "up_qty": up_qty,
-        "up_cost": up_cost,
-        "dn_qty": dn_qty,
-        "dn_cost": dn_cost,
+        "up_qty": dp.up_qty,
+        "up_cost": dp.up_cost,
+        "dn_qty": dp.dn_qty,
+        "dn_cost": dp.dn_cost,
         "total_cost": total_cost,
-        // 该时点若结算，盈亏 = 已实现 + 净持仓结算。
-        "pnl_if_up_wins": realized + up_qty - total_cost,
-        "pnl_if_dn_wins": realized + dn_qty - total_cost,
+        "pnl_if_up_wins": pnl_if_up,
+        "pnl_if_dn_wins": pnl_if_dn,
     })
 }
 
@@ -90,14 +117,14 @@ fn main() {
         // 从标题尾部取 "HH:MM" 作时间前缀。
         let start_hms = market.title.rsplit(' ').next().unwrap_or("00:00").to_string();
 
-        let operations: Vec<Value> = records.iter().map(|r| op_json(r, &start_hms)).collect();
+        // 展示层累计：卖出=买对面，两侧只增不减。
+        let mut dp = DisplayPosition::default();
+        let operations: Vec<Value> = records.iter().map(|r| op_json(r, &start_hms, &mut dp)).collect();
 
-        // final 全用 result 真值（engine 权威），保证 winner 侧 pnl_if 恒等于 actual_pnl。
-        let up_qty = f64v(result.up_net_qty);
-        let dn_qty = f64v(result.dn_net_qty);
-        let up_cost = f64v(result.up_net_cost);
-        let dn_cost = f64v(result.dn_net_cost);
-        let total_cost = up_cost + dn_cost;
+        // final：持仓/成本用展示层累计值（与末条 operation 一致）；
+        // 盈亏用引擎真值（result.pnl 是权威真实盈亏）。
+        let total_cost = dp.up_cost + dp.dn_cost;
+        let real_total_cost = f64v(result.up_net_cost + result.dn_net_cost);
         let realized = f64v(result.realized_pnl);
 
         report.push(json!({
@@ -112,14 +139,13 @@ fn main() {
             "operations": operations,
             "final": {
                 "actual_pnl": f64v(result.pnl),
-                "up_qty": up_qty,
-                "up_cost": up_cost,
-                "dn_qty": dn_qty,
-                "dn_cost": dn_cost,
+                "up_qty": dp.up_qty,
+                "up_cost": dp.up_cost,
+                "dn_qty": dp.dn_qty,
+                "dn_cost": dp.dn_cost,
                 "total_cost": total_cost,
-                // 结算盈亏 = 已实现 + 净持仓结算（winner 侧净持仓 − 净持仓成本）。
-                "pnl_if_up": realized + up_qty - total_cost,
-                "pnl_if_dn": realized + dn_qty - total_cost,
+                "pnl_if_up": realized + f64v(result.up_net_qty) - real_total_cost,
+                "pnl_if_dn": realized + f64v(result.dn_net_qty) - real_total_cost,
                 "deepest_phase": format!("{:?}", result.final_phase),
             },
         }));

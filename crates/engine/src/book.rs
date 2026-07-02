@@ -127,4 +127,23 @@ impl OrderBook {
             })
             .collect()
     }
+
+    /// 移除 book 中关联同一 LotId 的其他卖单（排除刚成交的那笔），防止重复成交。
+    /// 返回被移除的 OrderId 列表（调用方需向 simulator 发 Cancel）。
+    pub fn remove_sells_for_lot(&mut self, lot_id: LotId, except: OrderId) -> Vec<OrderId> {
+        let to_remove: Vec<OrderId> = self
+            .entries
+            .iter()
+            .filter(|(id, e)| {
+                **id != except
+                    && e.lot_id == Some(lot_id)
+                    && e.order.direction == OrderDirection::Sell
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for &id in &to_remove {
+            self.entries.remove(&id);
+        }
+        to_remove
+    }
 }

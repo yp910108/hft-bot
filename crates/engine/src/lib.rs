@@ -57,9 +57,11 @@ impl Engine {
             return vec![];
         }
 
-        let trigger = self.apply_event_facts(event);
+        let (trigger, mut extra_cmds) = self.apply_event_facts(event);
         let decision = self.decide(trigger);
-        self.apply_decision(decision)
+        let mut cmds = self.apply_decision(decision);
+        cmds.append(&mut extra_cmds);
+        cmds
     }
 
     /// 当前阶段。
@@ -74,16 +76,15 @@ impl Engine {
 
     // ─── ① 更新事件事实 ───
 
-    fn apply_event_facts(&mut self, event: &ExchangeEvent) -> Trigger {
+    fn apply_event_facts(&mut self, event: &ExchangeEvent) -> (Trigger, Vec<Command>) {
         match event {
             ExchangeEvent::BookUpdate(snapshot) => {
                 self.market = *snapshot;
-                Trigger::BookUpdate
+                (Trigger::BookUpdate, vec![])
             }
             ExchangeEvent::Filled(fill) => {
                 match fill.direction {
                     OrderDirection::Buy => {
-                        // 买入成交 → 开 Lot。
                         let buy_price = fill.cash / fill.filled_qty;
                         let lot_id = self.inventory.open_lot(
                             fill.side,
@@ -93,34 +94,45 @@ impl Engine {
                             self.now,
                         );
                         self.book.apply_fill(fill.order_id, fill.filled_qty);
-                        Trigger::Filled {
+                        (Trigger::Filled {
                             side: fill.side,
                             direction: OrderDirection::Buy,
                             lot_id: Some(lot_id),
-                        }
+                        }, vec![])
                     }
                     OrderDirection::Sell => {
-                        // 卖出成交 → 查关联 Lot 并平仓。
                         let lot_id = self.book.lot_id_for(fill.order_id);
-                        if let Some(lid) = lot_id {
-                            self.inventory.close_lot(fill.side, lid, fill.cash);
+                        let mut cancels = vec![];
+                        let mut closed = false;
+                        if let Some(lid) = lot_id
+                            && self.inventory.close_lot(fill.side, lid, fill.cash).is_some()
+                        {
+                            closed = true;
+                            let stale_ids = self.book.remove_sells_for_lot(lid, fill.order_id);
+                            for id in stale_ids {
+                                cancels.push(Command::CancelOrder(id));
+                            }
                         }
                         self.book.apply_fill(fill.order_id, fill.filled_qty);
-                        Trigger::Filled {
-                            side: fill.side,
-                            direction: OrderDirection::Sell,
-                            lot_id,
+                        if closed {
+                            (Trigger::Filled {
+                                side: fill.side,
+                                direction: OrderDirection::Sell,
+                                lot_id,
+                            }, cancels)
+                        } else {
+                            (Trigger::OrderUpdate, cancels)
                         }
                     }
                 }
             }
             ExchangeEvent::Canceled(order_id) | ExchangeEvent::CancelFailed(order_id) => {
                 self.book.remove(*order_id);
-                Trigger::OrderUpdate
+                (Trigger::OrderUpdate, vec![])
             }
             ExchangeEvent::Rejected { order_id, .. } => {
                 self.book.remove(*order_id);
-                Trigger::OrderUpdate
+                (Trigger::OrderUpdate, vec![])
             }
         }
     }

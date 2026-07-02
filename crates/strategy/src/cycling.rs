@@ -26,18 +26,15 @@ impl CyclingStrategy {
 
         let mut commands = Vec::new();
         let tp = ctx.config.tp(ctx.progress);
-        let sl = ctx.config.sl(ctx.progress);
 
-        // ── 止盈扫描 ──
-        // 0xe00740bc 的做法：买入成交后立即在 buy_price+tp 挂好 Maker 卖单等人来吃，
-        // 不等 bid 涨到位才挂。所以只要 Lot 没有对应的止盈卖单就立刻挂。
+        // ── 逐 Lot 挂止盈单：每个 Lot 有且只有一个 Maker 卖单 ──
+        // 不做止损换单（会引起撤单竞态导致重复成交）。
+        // 涨了止盈单自然成交；跌了止盈单不成交，扛到结算靠 sum_avg。
         for side in [Side::Up, Side::Down] {
             for lot in ctx.inventory.open_lots(side) {
-                // 已有卖单绑定此 Lot → 跳过。
-                if has_sell_for_lot(ctx.active_orders, lot.lot_id) {
+                if find_sell_for_lot(ctx.active_orders, lot.lot_id).is_some() {
                     continue;
                 }
-
                 let target_price = lot.buy_price + tp;
                 let price = ctx.constraints.quantize_price_up(target_price);
                 commands.push(CommandIntent::SubmitSell {
@@ -48,33 +45,6 @@ impl CyclingStrategy {
                     role: OrderRole::Maker,
                     tif: TimeInForce::Gtc,
                 });
-            }
-        }
-
-        // ── 止损扫描 ──
-        for side in [Side::Up, Side::Down] {
-            for lot in ctx.inventory.open_lots(side) {
-                let Some(bid) = ctx.market.book(side).best_bid else {
-                    continue;
-                };
-
-                let drawdown = lot.buy_price - bid;
-                if drawdown >= sl {
-                    // 浮亏超过止损线 → 撤该 Lot 的止盈卖单 + Taker 卖出止损。
-                    if let Some(sell_order_id) = find_sell_for_lot(ctx.active_orders, lot.lot_id) {
-                        commands.push(CommandIntent::Cancel(sell_order_id));
-                    }
-                    // 以 bid 作为限价下限，Taker 卖出（IOC）。
-                    let price = ctx.constraints.quantize_price(bid);
-                    commands.push(CommandIntent::SubmitSell {
-                        lot_id: lot.lot_id,
-                        side,
-                        price,
-                        qty: lot.qty,
-                        role: OrderRole::Taker,
-                        tif: TimeInForce::Ioc,
-                    });
-                }
             }
         }
 
@@ -127,14 +97,7 @@ pub(crate) fn inventory_allows_buy(ctx: &DecisionContext, side: Side) -> bool {
     true
 }
 
-/// 某 Lot 是否已有对应的止盈卖单挂着。
-fn has_sell_for_lot(orders: &[ActiveOrder], lot_id: LotId) -> bool {
-    orders
-        .iter()
-        .any(|o| o.lot_id == Some(lot_id) && o.direction == OrderDirection::Sell)
-}
-
-/// 找到某 Lot 对应的止盈卖单的 order_id（止损时需撤它）。
+/// 找某 Lot 对应的卖单 order_id（有就说明已挂）。
 fn find_sell_for_lot(orders: &[ActiveOrder], lot_id: LotId) -> Option<domain::order::OrderId> {
     orders
         .iter()
@@ -325,72 +288,6 @@ mod tests {
             .filter(|c| matches!(c, CommandIntent::SubmitSell { .. }))
             .collect();
         assert!(sell_cmds.is_empty());
-    }
-
-    #[test]
-    fn triggers_stop_loss_when_drawdown_exceeds_sl() {
-        let mut inv = Inventory::new();
-        let lot_id = inv.open_lot(Side::Up, dec!(0.50), dec!(10), dec!(5.00), 100);
-
-        // UP bid = 0.45, drawdown = 0.50 − 0.45 = 0.05 ≥ sl(Q1) = 0.04 → 止损。
-        let market = make_market(dec!(0.45), dec!(0.54));
-
-        // 已有止盈卖单要撤。
-        let existing = vec![ActiveOrder {
-            order_id: OrderId(50),
-            side: Side::Up,
-            direction: OrderDirection::Sell,
-            price: dec!(0.55),
-            qty: dec!(10),
-            role: OrderRole::Maker,
-            lot_id: Some(lot_id),
-        }];
-
-        let ctx = ctx_with_inventory(&inv, &existing, market, dec!(0.10));
-        let strategy = CyclingStrategy;
-        let decision = strategy.decide(&ctx);
-
-        // 应有：Cancel(50) + SubmitSell(Taker)。
-        let cancel_cmds: Vec<_> = decision
-            .commands
-            .iter()
-            .filter(|c| matches!(c, CommandIntent::Cancel(_)))
-            .collect();
-        assert_eq!(cancel_cmds.len(), 1);
-        match cancel_cmds[0] {
-            CommandIntent::Cancel(id) => assert_eq!(*id, OrderId(50)),
-            _ => panic!("应为 Cancel"),
-        }
-
-        let taker_sells: Vec<_> = decision
-            .commands
-            .iter()
-            .filter(|c| {
-                matches!(
-                    c,
-                    CommandIntent::SubmitSell {
-                        role: OrderRole::Taker,
-                        ..
-                    }
-                )
-            })
-            .collect();
-        assert_eq!(taker_sells.len(), 1);
-        match taker_sells[0] {
-            CommandIntent::SubmitSell {
-                lot_id: id,
-                price,
-                role,
-                tif,
-                ..
-            } => {
-                assert_eq!(*id, lot_id);
-                assert_eq!(*price, dec!(0.45));
-                assert_eq!(*role, OrderRole::Taker);
-                assert_eq!(*tif, TimeInForce::Ioc);
-            }
-            _ => panic!("应为 SubmitSell"),
-        }
     }
 
     #[test]

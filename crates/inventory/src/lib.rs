@@ -70,9 +70,9 @@ impl SideInventory {
         }
     }
 
-    /// 遍历未平 Lot 的只读引用。
+    /// 遍历未平 Lot，最近买入的在前（LIFO：止盈优先卖刚买的便宜货）。
     fn iter(&self) -> impl Iterator<Item = &Lot> {
-        self.lots.iter()
+        self.lots.iter().rev()
     }
 
     /// 未平 Lot 数量。
@@ -284,12 +284,13 @@ mod tests {
     }
 
     #[test]
-    fn open_lots_iterates_in_insertion_order() {
+    fn open_lots_iterates_most_recent_first() {
         let mut inv = Inventory::new();
         let id0 = inv.open_lot(Side::Up, dec!(0.45), dec!(10), dec!(4.50), 100);
         let id1 = inv.open_lot(Side::Up, dec!(0.40), dec!(10), dec!(4.00), 200);
+        // LIFO：最近买入的 id1 在前。
         let ids: Vec<LotId> = inv.open_lots(Side::Up).map(|l| l.lot_id).collect();
-        assert_eq!(ids, vec![id0, id1]);
+        assert_eq!(ids, vec![id1, id0]);
     }
 
     #[test]

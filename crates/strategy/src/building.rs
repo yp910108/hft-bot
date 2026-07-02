@@ -7,6 +7,7 @@
 //! - 超过 building_end 时触发阶段跳转到 Cycling。
 
 use crate::context::{ActiveOrder, CommandIntent, Decision, DecisionContext};
+use crate::cycling;
 use domain::order::{OrderDirection, TimeInForce};
 use domain::phase::Phase;
 use domain::types::{OrderRole, Side};
@@ -35,7 +36,7 @@ impl BuildingStrategy {
                 continue;
             }
             // 第二版库存约束。
-            if !crate::cycling::inventory_allows_buy(ctx, side) {
+            if !cycling::inventory_allows_buy(ctx, side) {
                 continue;
             }
             if let Some(cmd) = make_buy_intent(ctx, side) {
