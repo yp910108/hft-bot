@@ -387,9 +387,23 @@ mod tests {
         let mut inv = Inventory::new();
         inv.open_lot(Side::Up, dec!(0.45), dec!(500), dec!(225.00), 100);
 
-        // 默认配置无 cap。
+        // 显式无 cap 配置。
+        let cfg = StrategyConfig {
+            inventory_cap: None,
+            imbalance_cap: None,
+            ..StrategyConfig::default()
+        };
         let market = make_market(dec!(0.44), dec!(0.54));
-        let ctx = ctx_with_inventory(&inv, &[], market, dec!(0.20));
+        let ctx = DecisionContext {
+            trigger: Trigger::BookUpdate,
+            progress: dec!(0.20),
+            market,
+            inventory: &inv,
+            active_orders: &[],
+            free_cash: dec!(1000),
+            constraints: OrderConstraints::default(),
+            config: &cfg,
+        };
         assert!(inventory_allows_buy(&ctx, Side::Up));
         assert!(inventory_allows_buy(&ctx, Side::Down));
     }

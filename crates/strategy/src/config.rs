@@ -40,8 +40,8 @@ impl Default for StrategyConfig {
             harvest_start: dec!(0.83),
             settle_start: dec!(0.967),
             tp_by_quartile: [dec!(0.05), dec!(0.06), dec!(0.08), dec!(0.10)],
-            inventory_cap: None,
-            imbalance_cap: None,
+            inventory_cap: Some(dec!(50)),
+            imbalance_cap: Some(dec!(20)),
             symmetry_threshold: None,
         }
     }
