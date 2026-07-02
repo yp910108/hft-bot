@@ -32,7 +32,6 @@ pub struct Engine {
     market: MarketSnapshot,
 
     now: Millis,
-    time_to_expiry: Millis,
 }
 
 impl Engine {
@@ -46,19 +45,12 @@ impl Engine {
             generation: Generation::new(),
             market: MarketSnapshot::default(),
             now: 0,
-            time_to_expiry: 900_000, // 15min
         }
     }
 
     /// 主入口：处理一个事件，返回要下发的指令。
-    pub fn handle_event(
-        &mut self,
-        event: &ExchangeEvent,
-        now: Millis,
-        time_to_expiry: Millis,
-    ) -> Vec<Command> {
+    pub fn handle_event(&mut self, event: &ExchangeEvent, now: Millis) -> Vec<Command> {
         self.now = now;
-        self.time_to_expiry = time_to_expiry;
 
         // 终态不再处理。
         if self.phase.is_terminal() {
@@ -78,11 +70,6 @@ impl Engine {
     /// 逐笔账本只读引用（回测结算用）。
     pub fn inventory(&self) -> &Inventory {
         &self.inventory
-    }
-
-    /// 活跃挂单数。
-    pub fn resting_order_count(&self) -> usize {
-        self.book.len()
     }
 
     // ─── ① 更新事件事实 ───
@@ -300,15 +287,14 @@ mod tests {
         rx: &mut tokio::sync::mpsc::UnboundedReceiver<ExchangeEvent>,
         snap: &MarketSnapshot,
         now: Millis,
-        tte: Millis,
     ) {
         // 先喂行情撮合。
         sim.on_market(snap);
         // 发送 BookUpdate 事件给 engine。
-        let book_cmds = engine.handle_event(&ExchangeEvent::BookUpdate(*snap), now, tte);
+        let book_cmds = engine.handle_event(&ExchangeEvent::BookUpdate(*snap), now);
         // 处理 sim 撮合产出的 Fill 事件。
         while let Ok(event) = rx.try_recv() {
-            let fill_cmds = engine.handle_event(&event, now, tte);
+            let fill_cmds = engine.handle_event(&event, now);
             for cmd in fill_cmds {
                 dispatch(sim, &cmd);
             }
@@ -334,7 +320,7 @@ mod tests {
         let (mut sim, mut rx) = Simulator::new(FeeModel::zero());
         let snap = snapshot(dec!(0.55), dec!(0.56), dec!(0.44), dec!(0.45));
 
-        tick(&mut engine, &mut sim, &mut rx, &snap, 6000, 894_000);
+        tick(&mut engine, &mut sim, &mut rx, &snap, 6000);
 
         // Engine 应在两侧各挂一笔 Maker 买单。
         assert!(sim.resting_order_count() >= 2);
@@ -348,7 +334,7 @@ mod tests {
         let snap = snapshot(dec!(0.55), dec!(0.56), dec!(0.44), dec!(0.45));
 
         // progress = 72000/900000 = 0.08 → 应跳转 Cycling。
-        tick(&mut engine, &mut sim, &mut rx, &snap, 72_000, 828_000);
+        tick(&mut engine, &mut sim, &mut rx, &snap, 72_000);
 
         assert_eq!(engine.phase(), Phase::Cycling);
     }
@@ -360,11 +346,11 @@ mod tests {
 
         // 第一个 tick：挂买单。
         let snap = snapshot(dec!(0.50), dec!(0.51), dec!(0.49), dec!(0.50));
-        tick(&mut engine, &mut sim, &mut rx, &snap, 6000, 894_000);
+        tick(&mut engine, &mut sim, &mut rx, &snap, 6000);
 
         // 第二个 tick：ask 下穿 → 买单成交。
         let snap2 = snapshot(dec!(0.48), dec!(0.49), dec!(0.50), dec!(0.51));
-        tick(&mut engine, &mut sim, &mut rx, &snap2, 7000, 893_000);
+        tick(&mut engine, &mut sim, &mut rx, &snap2, 7000);
 
         // 应有 Lot 开立。
         assert!(
@@ -380,27 +366,27 @@ mod tests {
 
         // tick 1: 建仓期挂买单。
         let snap1 = snapshot(dec!(0.45), dec!(0.46), dec!(0.54), dec!(0.55));
-        tick(&mut engine, &mut sim, &mut rx, &snap1, 6000, 894_000);
+        tick(&mut engine, &mut sim, &mut rx, &snap1, 6000);
 
         // tick 2: ask 穿越→UP买单成交(0.45 挂单,ask=0.44<0.45 成交)。
         let snap2 = snapshot(dec!(0.44), dec!(0.44), dec!(0.55), dec!(0.56));
-        tick(&mut engine, &mut sim, &mut rx, &snap2, 7000, 893_000);
+        tick(&mut engine, &mut sim, &mut rx, &snap2, 7000);
 
         let up_lots_before = engine.inventory().lot_count(Side::Up);
 
         // 进入 Cycling（手动推 progress > 8%）。
         let snap3 = snapshot(dec!(0.51), dec!(0.52), dec!(0.48), dec!(0.49));
-        tick(&mut engine, &mut sim, &mut rx, &snap3, 73_000, 827_000);
+        tick(&mut engine, &mut sim, &mut rx, &snap3, 73_000);
         assert_eq!(engine.phase(), Phase::Cycling);
 
         // tick: bid 涨到 0.51 ≥ 0.45 + 0.05(tp) = 0.50 → 应挂止盈卖单。
         // 再 tick 一次让卖单成交（bid > 卖单价 0.50）。
         let snap4 = snapshot(dec!(0.52), dec!(0.53), dec!(0.47), dec!(0.48));
-        tick(&mut engine, &mut sim, &mut rx, &snap4, 74_000, 826_000);
+        tick(&mut engine, &mut sim, &mut rx, &snap4, 74_000);
 
         // 如果止盈卖单挂上且 bid 穿越，下一个 tick 会成交。
         let snap5 = snapshot(dec!(0.52), dec!(0.53), dec!(0.47), dec!(0.48));
-        tick(&mut engine, &mut sim, &mut rx, &snap5, 75_000, 825_000);
+        tick(&mut engine, &mut sim, &mut rx, &snap5, 75_000);
 
         // 检查：已实现盈亏应 > 0（如果止盈成交了）或 Lot 数减少。
         let pnl = engine.inventory().realized_pnl();
@@ -420,7 +406,7 @@ mod tests {
 
         // bid 0.55 × 10 股 = $5.5 > $5 可用 → 不应挂。
         let snap = snapshot(dec!(0.55), dec!(0.56), dec!(0.54), dec!(0.55));
-        tick(&mut engine, &mut sim, &mut rx, &snap, 6000, 894_000);
+        tick(&mut engine, &mut sim, &mut rx, &snap, 6000);
 
         // 两侧都太贵，不应有买单。
         assert_eq!(sim.resting_order_count(), 0);

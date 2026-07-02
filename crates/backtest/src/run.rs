@@ -2,7 +2,7 @@
 //!
 //! 时间模型：逐秒快照，第 i 个快照对应场内第 i 秒。15 分钟场共 ~900 个快照。
 //! 每个快照：① 喂行情给 Simulator 撮合 ② Simulator 产出的事件依次喂 Engine
-//! ③ Engine 产出的指令下发给 Simulator ④ 推进虚拟时钟。
+//! ③ Engine 产出的指令下发给 Simulator。
 //! 结算：已实现盈亏 + 赢家侧净持仓 − 净投入。
 
 use crate::market::Market;
@@ -104,12 +104,10 @@ fn run_core(
 ) -> MatchResult {
     let mut engine = Engine::new(cfg);
     let (mut sim, mut rx) = Simulator::new(fee);
-    let n = market.snapshots.len() as u64;
     let mut fills = 0u32;
 
     for (i, snapshot) in market.snapshots.iter().enumerate() {
         let now: Millis = (i as u64 + 1) * TICK_MS;
-        let tte: Millis = n.saturating_sub(i as u64 + 1) * TICK_MS;
         let second = i as u64 + 1;
 
         // ① 喂行情给 Simulator，驱动挂单撮合。
@@ -118,7 +116,7 @@ fn run_core(
         // ② drain 事件 → engine 入账 → 收集指令（不立刻 dispatch，防止自我喂食循环）。
         let mut pending_cmds: Vec<Command> = Vec::new();
         while let Ok(event) = rx.try_recv() {
-            let cmds = engine.handle_event(&event, now, tte);
+            let cmds = engine.handle_event(&event, now);
             record_fill(&mut recorder, &engine, &event, second, &mut fills);
             pending_cmds.extend(cmds);
         }
@@ -128,14 +126,14 @@ fn run_core(
         }
 
         // ③ BookUpdate 事件喂 Engine，产出决策指令。
-        let cmds = engine.handle_event(&ExchangeEvent::BookUpdate(*snapshot), now, tte);
+        let cmds = engine.handle_event(&ExchangeEvent::BookUpdate(*snapshot), now);
         for cmd in &cmds {
             dispatch(&mut sim, cmd);
         }
 
         // ④ 处理 ②③ dispatch 产出的新事件（只入账收集指令，再统一 dispatch 一轮）。
         while let Ok(event) = rx.try_recv() {
-            let cmds = engine.handle_event(&event, now, tte);
+            let cmds = engine.handle_event(&event, now);
             record_fill(&mut recorder, &engine, &event, second, &mut fills);
             pending_cmds.extend(cmds);
         }

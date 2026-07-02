@@ -8,7 +8,7 @@
 use crate::context::{ActiveOrder, CommandIntent, Decision, DecisionContext};
 use domain::order::{OrderDirection, TimeInForce};
 use domain::phase::Phase;
-use domain::types::{OrderRole, Price, Side};
+use domain::types::{OrderRole, Side};
 use inventory::lot::LotId;
 
 /// 循环做市策略。
@@ -177,13 +177,6 @@ fn cheaper_side(ctx: &DecisionContext) -> (Side, Side) {
         (Some(u), Some(d)) if d < u => (Side::Down, Side::Up),
         _ => (Side::Up, Side::Down),
     }
-}
-
-/// 取便宜侧 bid 价格（给止损定价用的内部辅助，不对外暴露）。
-#[allow(dead_code)]
-fn _cheaper_bid(ctx: &DecisionContext) -> Option<Price> {
-    let (side, _) = cheaper_side(ctx);
-    ctx.market.book(side).best_bid
 }
 
 #[cfg(test)]

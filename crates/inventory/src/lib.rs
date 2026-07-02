@@ -50,20 +50,6 @@ impl SideInventory {
         Some(self.lots.remove(pos))
     }
 
-    /// 部分平仓：减少指定 Lot 的 qty。减完归零则移除。
-    /// 返回实际减少的股数。找不到返回 0。
-    fn partial_close(&mut self, lot_id: LotId, qty: Qty) -> Qty {
-        let Some(lot) = self.lots.iter_mut().find(|l| l.lot_id == lot_id) else {
-            return Decimal::ZERO;
-        };
-        let closed = qty.min(lot.qty);
-        lot.qty -= closed;
-        if lot.qty <= Decimal::ZERO {
-            self.lots.retain(|l| l.lot_id != lot_id);
-        }
-        closed
-    }
-
     /// 某侧净持仓 = Σ lots.qty。
     fn net_qty(&self) -> Qty {
         self.lots.iter().map(|l| l.qty).sum()
@@ -162,28 +148,6 @@ impl Inventory {
         Some(pnl)
     }
 
-    /// 部分平仓：平掉指定 Lot 的一部分股数。
-    ///
-    /// 返回该部分的已实现盈亏。Lot 不存在或 qty 为 0 返回 None。
-    pub fn partial_close(
-        &mut self,
-        side: Side,
-        lot_id: LotId,
-        qty: Qty,
-        cash_in_amount: Money,
-    ) -> Option<Money> {
-        let lot = self.side(side).lots.iter().find(|l| l.lot_id == lot_id)?;
-        let cost_portion = lot.buy_price * qty.min(lot.qty);
-        let closed_qty = self.side_mut(side).partial_close(lot_id, qty);
-        if closed_qty <= Decimal::ZERO {
-            return None;
-        }
-        let pnl = cash_in_amount - cost_portion;
-        self.realized_pnl += pnl;
-        self.cash_in += cash_in_amount;
-        Some(pnl)
-    }
-
     // ─── 读操作 ───
 
     /// 某侧净持仓股数。
@@ -228,16 +192,6 @@ impl Inventory {
     /// 供现金哨兵和结算用。
     pub fn net_invested(&self) -> Money {
         self.cash_out - self.cash_in
-    }
-
-    /// 累计买入花费。
-    pub fn cash_out(&self) -> Money {
-        self.cash_out
-    }
-
-    /// 累计卖出回收。
-    pub fn cash_in(&self) -> Money {
-        self.cash_in
     }
 
     /// 产出聚合快照（供结算和报告用）。
@@ -291,7 +245,6 @@ mod tests {
         assert_eq!(inv.net_qty(Side::Up), dec!(10));
         assert_eq!(inv.net_cost(Side::Up), dec!(4.50));
         assert_eq!(inv.net_avg(Side::Up), Some(dec!(0.45)));
-        assert_eq!(inv.cash_out(), dec!(4.50));
         assert_eq!(inv.net_invested(), dec!(4.50));
     }
 
@@ -305,7 +258,6 @@ mod tests {
         assert_eq!(pnl, Some(dec!(0.50)));
         assert_eq!(inv.realized_pnl(), dec!(0.50));
         assert_eq!(inv.net_qty(Side::Up), Decimal::ZERO);
-        assert_eq!(inv.cash_in(), dec!(5.00));
         assert_eq!(inv.net_invested(), dec!(-0.50)); // 回收多于投入
     }
 
@@ -313,28 +265,6 @@ mod tests {
     fn close_lot_returns_none_for_unknown_id() {
         let mut inv = Inventory::new();
         assert_eq!(inv.close_lot(Side::Up, LotId(99), dec!(5.00)), None);
-    }
-
-    #[test]
-    fn partial_close_reduces_qty() {
-        let mut inv = Inventory::new();
-        let id = inv.open_lot(Side::Down, dec!(0.55), dec!(20), dec!(11.00), 2000);
-        // 部分平仓 8 股，回收 $4.80（Maker @ 0.60 × 8 股）。
-        let pnl = inv.partial_close(Side::Down, id, dec!(8), dec!(4.80));
-        // 成本 = 0.55 × 8 = 4.40；盈亏 = 4.80 − 4.40 = +0.40。
-        assert_eq!(pnl, Some(dec!(0.40)));
-        assert_eq!(inv.net_qty(Side::Down), dec!(12)); // 20 − 8
-        assert_eq!(inv.realized_pnl(), dec!(0.40));
-        assert_eq!(inv.lot_count(Side::Down), 1); // Lot 还在（未全平）
-    }
-
-    #[test]
-    fn partial_close_removes_lot_when_fully_closed() {
-        let mut inv = Inventory::new();
-        let id = inv.open_lot(Side::Up, dec!(0.40), dec!(10), dec!(4.00), 500);
-        let pnl = inv.partial_close(Side::Up, id, dec!(10), dec!(5.00));
-        assert_eq!(pnl, Some(dec!(1.00)));
-        assert_eq!(inv.lot_count(Side::Up), 0);
     }
 
     #[test]
@@ -392,11 +322,10 @@ mod tests {
         inv.open_lot(Side::Up, dec!(0.45), dec!(10), dec!(4.50), 100);
         inv.open_lot(Side::Down, dec!(0.55), dec!(10), dec!(5.50), 200);
         // 总买入: 4.50 + 5.50 = 10.00
-        assert_eq!(inv.cash_out(), dec!(10.00));
+        assert_eq!(inv.net_invested(), dec!(10.00));
         // 卖出一笔 UP: 回收 5.00
         let id = LotId(0);
         inv.close_lot(Side::Up, id, dec!(5.00));
-        assert_eq!(inv.cash_in(), dec!(5.00));
         assert_eq!(inv.net_invested(), dec!(5.00)); // 10 − 5
     }
 }

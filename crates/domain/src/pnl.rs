@@ -72,18 +72,6 @@ impl PositionSnapshot {
     pub fn settle_pnl(&self, winner: Side) -> Money {
         self.qty(winner) - self.total_cost()
     }
-
-    /// 浮亏 pnl：该侧现在按 best_bid 强平能拿回多少 = 该侧净持仓 × bid − 该侧成本。
-    ///
-    /// 用本侧成本、用 bid（立即割肉的最坏价）。只对有持仓的侧有意义，无持仓返回 None。
-    pub fn float_pnl(&self, side: Side, best_bid: Price) -> Option<Money> {
-        let qty = self.qty(side);
-        if qty > Qty::ZERO {
-            Some(qty * best_bid - self.cost(side))
-        } else {
-            None
-        }
-    }
 }
 
 #[cfg(test)]
@@ -128,18 +116,5 @@ mod tests {
         // 只有 Up 持仓 → sum_avg = Up 均价。
         let p = pos(dec!(100), dec!(0), dec!(45), dec!(0));
         assert_eq!(p.sum_avg(), dec!(0.45));
-    }
-
-    #[test]
-    fn float_pnl_uses_side_cost_and_bid() {
-        // Up 持仓 100、成本 45，bid 0.40 → 强平拿回 40 − 45 = −5。
-        let p = pos(dec!(100), dec!(0), dec!(45), dec!(0));
-        assert_eq!(p.float_pnl(Side::Up, dec!(0.40)), Some(dec!(-5.00)));
-    }
-
-    #[test]
-    fn float_pnl_none_when_no_position() {
-        let p = pos(dec!(100), dec!(0), dec!(45), dec!(0));
-        assert_eq!(p.float_pnl(Side::Down, dec!(0.50)), None);
     }
 }
