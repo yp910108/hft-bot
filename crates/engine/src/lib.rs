@@ -103,26 +103,20 @@ impl Engine {
                     OrderDirection::Sell => {
                         let lot_id = self.book.lot_id_for(fill.order_id);
                         let mut cancels = vec![];
-                        let mut closed = false;
                         if let Some(lid) = lot_id
                             && self.inventory.close_lot(fill.side, lid, fill.cash).is_some()
                         {
-                            closed = true;
                             let stale_ids = self.book.remove_sells_for_lot(lid, fill.order_id);
                             for id in stale_ids {
                                 cancels.push(Command::CancelOrder(id));
                             }
                         }
                         self.book.apply_fill(fill.order_id, fill.filled_qty);
-                        if closed {
-                            (Trigger::Filled {
-                                side: fill.side,
-                                direction: OrderDirection::Sell,
-                                lot_id,
-                            }, cancels)
-                        } else {
-                            (Trigger::OrderUpdate, cancels)
-                        }
+                        (Trigger::Filled {
+                            side: fill.side,
+                            direction: OrderDirection::Sell,
+                            lot_id,
+                        }, cancels)
                     }
                 }
             }
