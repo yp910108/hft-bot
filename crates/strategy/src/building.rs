@@ -45,9 +45,8 @@ impl BuildingStrategy {
             let existing_buy = find_buy_order(ctx.active_orders, side);
 
             if let Some(existing) = existing_buy {
-                // 已有买单：检查是否脱离盘口（挂单价比当前 bid 低超过 1 tick）。
-                if bid - existing.price > ctx.constraints.quantize_price(rust_decimal_macros::dec!(0.01)) {
-                    // 废单，撤掉后重挂。
+                // 只要挂单价严格低于当前 bid，就说明掉队了，撤掉重挂。
+                if existing.price < bid {
                     commands.push(CommandIntent::Cancel(existing.order_id));
                     if let Some(cmd) = make_buy_intent(ctx, side) {
                         commands.push(cmd);
@@ -203,9 +202,17 @@ mod tests {
         let decision = strategy.decide(&ctx);
 
         // UP 侧：Cancel(旧单) + SubmitBuy(新单@0.55)。DN 侧：SubmitBuy(@0.44)。
-        let cancels: Vec<_> = decision.commands.iter().filter(|c| matches!(c, CommandIntent::Cancel(_))).collect();
+        let cancels: Vec<_> = decision
+            .commands
+            .iter()
+            .filter(|c| matches!(c, CommandIntent::Cancel(_)))
+            .collect();
         assert_eq!(cancels.len(), 1);
-        let buys: Vec<_> = decision.commands.iter().filter(|c| matches!(c, CommandIntent::SubmitBuy { .. })).collect();
+        let buys: Vec<_> = decision
+            .commands
+            .iter()
+            .filter(|c| matches!(c, CommandIntent::SubmitBuy { .. }))
+            .collect();
         assert_eq!(buys.len(), 2); // UP 新单 + DN 新单
     }
 
@@ -217,7 +224,7 @@ mod tests {
             order_id: domain::order::OrderId(1),
             side: Side::Up,
             direction: OrderDirection::Buy,
-            price: dec!(0.54),
+            price: dec!(0.55),
             qty: dec!(10),
             role: OrderRole::Maker,
             lot_id: None,
@@ -232,7 +239,11 @@ mod tests {
         let decision = strategy.decide(&ctx);
 
         // 不撤 UP 旧单，只挂 DN。
-        let cancels: Vec<_> = decision.commands.iter().filter(|c| matches!(c, CommandIntent::Cancel(_))).collect();
+        let cancels: Vec<_> = decision
+            .commands
+            .iter()
+            .filter(|c| matches!(c, CommandIntent::Cancel(_)))
+            .collect();
         assert!(cancels.is_empty());
         assert_eq!(decision.commands.len(), 1);
         match decision.commands[0] {

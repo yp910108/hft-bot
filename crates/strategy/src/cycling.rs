@@ -62,7 +62,7 @@ impl CyclingStrategy {
             let existing_buy = find_buy_order(ctx.active_orders, side);
 
             if let Some(existing) = existing_buy {
-                if bid - existing.price > rust_decimal_macros::dec!(0.01) {
+                if existing.price < bid {
                     commands.push(CommandIntent::Cancel(existing.order_id));
                     if let Some(cmd) = make_buy_intent(ctx, side) {
                         commands.push(cmd);
@@ -262,7 +262,9 @@ mod tests {
             .collect();
         assert_eq!(sell_cmds.len(), 1);
         match sell_cmds[0] {
-            CommandIntent::SubmitSell { lot_id: id, price, .. } => {
+            CommandIntent::SubmitSell {
+                lot_id: id, price, ..
+            } => {
                 assert_eq!(*id, lot_id);
                 assert_eq!(*price, dec!(0.45)); // buy_price + tp
             }
