@@ -11,6 +11,7 @@ use domain::order::{OrderDirection, TimeInForce};
 use domain::phase::Phase;
 use domain::types::{OrderRole, Side};
 use inventory::lot::LotId;
+use rust_decimal_macros::dec;
 
 /// 收手变现策略。
 pub struct HarvestingStrategy;
@@ -36,7 +37,8 @@ impl HarvestingStrategy {
                 }
 
                 let target_price = lot.buy_price + tp;
-                let price = ctx.constraints.quantize_price_up(target_price);
+                let capped = target_price.min(dec!(0.99));
+                let price = ctx.constraints.quantize_price_up(capped);
                 commands.push(CommandIntent::SubmitSell {
                     lot_id: lot.lot_id,
                     side,

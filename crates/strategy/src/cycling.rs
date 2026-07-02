@@ -10,6 +10,7 @@ use domain::order::{OrderDirection, TimeInForce};
 use domain::phase::Phase;
 use domain::types::{OrderRole, Side};
 use inventory::lot::LotId;
+use rust_decimal_macros::dec;
 
 /// 循环做市策略。
 pub struct CyclingStrategy;
@@ -36,7 +37,9 @@ impl CyclingStrategy {
                     continue;
                 }
                 let target_price = lot.buy_price + tp;
-                let price = ctx.constraints.quantize_price_up(target_price);
+                // 价格不能超过 0.99（二元市场最高价），否则会被拒单。
+                let capped = target_price.min(dec!(0.99));
+                let price = ctx.constraints.quantize_price_up(capped);
                 commands.push(CommandIntent::SubmitSell {
                     lot_id: lot.lot_id,
                     side,
